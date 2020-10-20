@@ -1,0 +1,19 @@
+name: dhs-audience-service
+ports:
+  external: 80
+  container: 9000
+stripPrefix: false
+monitor: false
+healthcheck:
+  readinessProbe:
+    httpGet:
+      # TODO: Change to the microservice healthcheck url
+      path: /dhs-audience-service/healthcheck?readinessProbe
+    initialDelaySeconds: 120 # This prevents maestro from destroying this too soon
+    periodSeconds: 10
+  livenessProbe:
+    httpGet:
+      # TODO: Change to the microservice healthcheck url
+      path: /dhs-audience-service/healthcheck?livenessProbe
+    initialDelaySeconds: 120 # This delays the polling of the "liveness" of a container
+    periodSeconds: 5

@@ -1,0 +1,778 @@
+package services
+
+import java.sql.{Connection, DriverManager, ResultSet, Statement}
+
+import javax.inject.{Inject, Singleton}
+import play.api.Configuration
+import play.api.inject.ApplicationLifecycle
+import scala.collection.mutable
+import scala.concurrent.Future
+import play.api.libs.json.{JsArray, JsObject, JsString, Json, JsLookupResult, JsValue, JsBoolean}
+import utils.scaffolds.Logging
+import data.mssql.MsSql
+import scala.collection.mutable.ListBuffer
+import scala.collection.immutable.ListMap
+@Singleton
+class FilterConfigService @Inject()(lifecycle: ApplicationLifecycle, config: Configuration) extends Logging with DHSServiceable {
+
+  val mssqlConfig = MsSql.ApplicationConfiguration(config)
+
+  def getAudienceSchema(): String = {
+    if (mssqlConfig.prop.getProperty("dhs.audienceSchema") != null) mssqlConfig.prop.getProperty("dhs.audienceSchema") else "_AudienceSvc"
+  }
+
+  val audienceSchema: String = getAudienceSchema();
+
+  def saveFiltersConfig(filters: String): Unit = {
+    val conn = DriverManager.getConnection(mssqlConfig.Url)
+    conn.setAutoCommit(false)
+    try {
+      val jsonFilters = Json.parse(filters)
+      val filtersArray = jsonFilters.as[JsArray]
+      var i = 0
+      while (i < filtersArray.value.size) {
+        val filter: JsLookupResult = filtersArray.apply(i)
+        val res = saveFilterConfigJson(filter.get, conn)
+      }
+      conn.commit()
+    } catch {
+      case exc: Exception =>
+        exc.printStackTrace()
+        conn.rollback()
+    } finally {
+      conn.close()
+    }
+  }
+
+  def saveFilterConfig(filter: String): Unit = {
+    val conn = DriverManager.getConnection(mssqlConfig.Url)
+    conn.setAutoCommit(false)
+
+    try {
+      val jsonFilter = Json.parse(filter)
+      saveFilterConfigJson(jsonFilter, conn)
+      conn.commit()
+
+    } catch {
+      case exc: Exception =>
+        logger.error(s"Exception while saving filter config", exc)
+        conn.rollback()
+        throw exc
+    } finally {
+      conn.close()
+    }
+  }
+
+
+  def saveFilterConfigJson(jsonFilter: JsValue, conn: Connection): Unit = {
+
+
+    //val jsonFilter = Json.parse(filter)
+    //println(s"jsonfilter config $jsonFilter")
+    val sponsorId = ((jsonFilter) \ ("sponsorId")).as[JsString].value
+    val filtersHier = ((jsonFilter) \ ("hierarchical")).as[JsArray]
+    val filtersStandard = ((jsonFilter) \ ("standard")).as[JsArray]
+    //println(s"sponsor id ${sponsorId}")
+    //println(s"hierarchical filters ${filtersHier}")
+    //println(s"standard filters ${filtersStandard}")
+    persistHierarchicalFilters(filtersHier, sponsorId, conn)
+    persistStandardFilters(filtersStandard, sponsorId, conn)
+
+
+  }
+
+  def persistHierarchicalFilters(filters: JsArray, sponsorId: String, conn: Connection): Unit = {
+
+    var insertsSB = new mutable.StringBuilder
+    var i = 0
+    while (i < filters.value.size) {
+      val filter: JsLookupResult = filters.apply(i)
+      val res = createHierarchicalFilterInsert(filter.get, i + 1, sponsorId, conn)
+      insertsSB = insertsSB.append(res).append(",")
+      i += 1
+    }
+    var inserts: String = null
+    if (insertsSB.length >= 1) {
+      inserts = insertsSB.substring(0, insertsSB.length - 1).toString()
+    }
+    val hierFilterSql = s"insert into ${audienceSchema}.FilterConfig(sponsorId, hierarchy, placeholder, " +
+      s"text, value, filterKey, filterAlias, filterTypeId, inputAs)  Values ${inserts}"
+    //println(s"hierFilterSql ${hierFilterSql}")
+    val stmtIns: Statement = conn.createStatement()
+    stmtIns.execute(hierFilterSql)
+
+  }
+
+  def persistStandardFilters(filters: JsArray, sponsorId: String, conn: Connection): Unit = {
+
+    var inserts = new mutable.StringBuilder
+    var i = 0
+    while (i < filters.value.size) {
+      val filter: JsLookupResult = filters.apply(i)
+      val res = saveStandardFilter(filter.get, sponsorId, conn)
+      i += 1
+    }
+  }
+
+  def createHierarchicalFilterInsert(filter: JsValue, i: Int, sponsorId: String, conn:Connection): String = {
+    //println(s"hierarchical filter $filter i $i")
+    val placeholder = (filter \ ("placeholder")).as[JsString].value
+    val text = (filter \ ("text")).as[JsString].value
+    val value = (filter \ ("value")).as[JsString].value
+    val key = (filter \ ("value")).as[JsString].value
+    val filterAlias= if (filter.as[JsObject].keys.contains("filterAlias")) {
+      (filter \ ("filterAlias")).as[JsString].value
+    }else {
+      ""
+    }
+    val filterTypeId=findFilterTypeId("hierarchical", conn)
+    val inputAs=fetchInputAsString("hierarchical")
+    s"('${sponsorId}',$i,'${placeholder}', '${text}', '${value}', '${key}', '${filterAlias}', ${filterTypeId},'${inputAs}')"
+
+  }
+
+  def fetchInputAsString(filterType:String)={
+    filterType match {
+      //case "compare" => "Alphanumeric"
+      case "enum" => "List"
+      case "delimited" => "Alphanumeric"
+      case "text" => "Alphanumeric"
+      case "hierarchical" => "Alphanumeric"
+      case _ => //logger.info(s"No options for filtertype ${filterType}")
+        ""
+    }
+  }
+
+  def saveStandardFilter(filter: JsValue, sponsorId: String, conn: Connection): Unit = {
+    //println(s"standard filter $filter")
+    val key = (filter \ ("key")).as[JsString].value
+    val value = (filter \ ("value")).as[JsString].value
+    val text = (filter \ ("text")).as[JsString].value
+    val filterType = (filter \ ("type")).as[JsString].value
+    val inputAs = if (filter.as[JsObject].keys.contains("inputAs")) {
+      if("string".equalsIgnoreCase((filter \ ("inputAs")).as[JsString].value)){
+        "Alphanumeric"
+      }else if("number".equalsIgnoreCase((filter \ ("inputAs")).as[JsString].value)){
+        "Numeric"
+      }else {
+        (filter \ ("inputAs")).as[JsString].value
+      }
+
+    } else {
+      fetchInputAsString(filterType)
+    }
+    val isPopular = (filter \ ("isPopular")).as[JsBoolean].value
+    val filterAlias = if (filter.as[JsObject].keys.contains("filterAlias")) {
+      (filter \ ("filterAlias")).as[JsString].value
+    } else {
+      ""
+    }
+
+    val delimiter = /*if (filter.as[JsObject].keys.contains("delimiter")) {
+      (filter \ ("delimiter")).as[JsString].value
+    } else {*/
+      ";"
+    //}
+
+    val filterTypeId: Int = findFilterTypeId(filterType, conn)
+
+    val filterId = persistStandardFilter(sponsorId, key, value, text, filterTypeId, inputAs, isPopular, filterAlias, delimiter,conn)
+
+    filterType match {
+      case "compare" => val operators = if (filter.as[JsObject].keys.contains("operators")) {
+        (filter \ ("operators")).as[JsArray]
+      } else {
+        (filter \ ("options")).as[JsArray]
+      }
+        saveFilterCompareGroups(operators, filterId, conn)
+      case "enum" => val options = (filter \ ("options")).as[JsArray]
+        saveFilterCompareGroups(options, filterId, conn)
+      case _ => logger.info(s"No options for filtertype ${filterType}")
+    }
+  }
+
+  def findFilterTypeId(filterType: String, conn: Connection): Int = {
+    val filterTypeSql = s"select id from  ${audienceSchema}.FilterType where FilterType= '${filterType}'"
+    val (columns, results) = executeQuery(conn, filterTypeSql)
+    if (results.hasNext) {
+      val result = results.next()
+      result.apply(0).toInt
+    } else {
+      throw new Exception(s"Filter type ${filterType} not found")
+    }
+  }
+
+  def persistStandardFilter(sponsorId: String, key: String, value: String, text: String, filterTypeId: Int,
+                            inputAs: String, isPopular: Boolean, filterAlias:String, delimiter:String, conn: Connection): Int = {
+    var isPopularBit: Int = 0
+    if (isPopular == true) {
+      isPopularBit = 1
+    }
+    val insert = s"('${sponsorId}','${key}', '${value}','${text}',${filterTypeId}, '${inputAs}',${isPopularBit}, " +
+      s"'${filterAlias}', '${delimiter}')"
+    val standardFilterSql = s"insert into ${audienceSchema}.FilterConfig(sponsorId, filterKey, value," +
+      s" text, filtertypeid, inputas, ispopular, filterAlias, delimiter) output INSERTED.filterId Values ${insert}"
+    //println(s"standardFilterSql ${standardFilterSql}")
+    val (columns, results) = executeQuery(conn, standardFilterSql)
+    if (results.hasNext) {
+      val result = results.next()
+      result.apply(0).toInt
+    } else {
+      throw new Exception(s"Standard filter config could not be created for sponsor ${sponsorId}")
+    }
+  }
+
+  def saveFilterCompareGroups(values: JsArray, filterId: Int, conn: Connection): Unit = {
+    val res = (for {compareGroup <- values.value
+                    resValue = persistCompareGroup(compareGroup, filterId, conn)
+
+                    } yield resValue).mkString(" ")
+  }
+
+  def persistCompareGroup(compareGroup: JsValue, filterId: Int, conn: Connection): Unit = {
+    val text = (compareGroup \ ("text")).as[JsString].value
+    val optionValue = (compareGroup \ ("value")).as[JsString].value
+    val insert = s"('${filterId}','${text}','${optionValue}')"
+    val filterCGSql = s"insert into ${audienceSchema}.FilterOptions(FilterId, text, value)  Values ${insert}"
+    //println(s"filterCGSql ${filterCGSql}")
+    val stmtIns: Statement = conn.createStatement()
+    stmtIns.execute(filterCGSql)
+  }
+
+  def getFilterConfigBySponsor(sponsorIdOld:String, sponsorIdNew: String): JsObject = {
+    val conn = DriverManager.getConnection(mssqlConfig.Url)
+    conn.setAutoCommit(false)
+    try {
+      val hierarchicalFiltersJson = fetchHierarchicalFilters(sponsorIdNew, conn)
+      val standardFiltersJson = fetchStandardFilters(sponsorIdNew, conn)
+      var sponsorId=sponsorIdNew
+      if("DEFAULT".equals(sponsorIdNew) && sponsorIdOld!=null){
+        sponsorId=sponsorIdOld
+      }
+      val sponsorIdJson = Json.obj("sponsorId" -> Json.toJson(sponsorId))
+      if (!"DEFAULT".equals(sponsorId) && standardFiltersJson == null && hierarchicalFiltersJson == null) {
+        val filterConfig=getFilterConfigBySponsor(sponsorIdNew,"DEFAULT")
+        saveFilterConfigJson(filterConfig,conn)
+        conn.commit()
+        filterConfig
+      } else {
+        sponsorIdJson + ("hierarchical" -> hierarchicalFiltersJson) + ("standard" -> standardFiltersJson)
+      }
+    } catch {
+      case exc: Exception =>
+        logger.error(s"Exception while fetching filters config for sponsor id ${sponsorIdNew}", exc)
+        exc.printStackTrace()
+        conn.rollback()
+        throw exc
+    } finally {
+      conn.close()
+    }
+
+  }
+
+  def getFilterConfigBySponsorAndKey(sponsorId: String, filterKey:String): JsValue = {
+    val conn = DriverManager.getConnection(mssqlConfig.Url)
+    try {
+      val iSqlQueryF = s"select filterid, filterkey, value, text, filtertypeid, inputAs, ispopular, " +
+        s"filterAlias, delimiter, placeholder from ${audienceSchema}.FilterConfig where SponsorId='${sponsorId}' and filterKey='${filterKey}' "
+      val (columns, results) = executeQuery(conn, iSqlQueryF)
+      if (!results.hasNext) {
+        null
+      } else {
+        val r = results.next
+        val compareGroupType = getCompareGroupType(r.apply(columns.indexOf("filtertypeid")), conn)
+        //println(s"cgtype ${compareGroupType}")
+        if ("hierarchical".equals(compareGroupType)) {
+          //println(s"cgtype here${compareGroupType}")
+          val hierFiltersJson = Json.obj("key" ->
+            r.apply(columns.indexOf("filterkey")), "placeholder" ->
+            r.apply(columns.indexOf("placeholder")), "text" -> r.apply(columns.indexOf("text")),
+            "value" -> r.apply(columns.indexOf("value")), "filterAlias" -> r.apply(columns.indexOf("filterAlias")),
+            "type" -> "hierarchical","inputAs" -> r.apply(columns.indexOf("inputAs")),
+            "isPopular" -> getIsPopularBoolean(r.apply(columns.indexOf("ispopular"))))
+            /*,"hierarchy" -> r.apply(columns.indexOf("Hierarchy"))*/
+          hierFiltersJson
+
+        } else {
+          var standardFiltersJson = Json.obj("key" -> r.apply(columns.indexOf("filterkey")), "value" -> r.apply(columns.indexOf("value")),
+            "text" -> r.apply(columns.indexOf("text")), "type" -> compareGroupType,
+            "inputAs" -> r.apply(columns.indexOf("inputAs")), "isPopular" -> getIsPopularBoolean(r.apply(columns.indexOf("ispopular"))),
+            "filterAlias" -> r.apply(columns.indexOf("filterAlias")),
+            "delimiter" -> r.apply(columns.indexOf("delimiter")))
+
+          val compareGroup = getFilterCompareGroup(compareGroupType, conn)
+          if (!"".equals(compareGroup)) {
+            standardFiltersJson = standardFiltersJson + (getFilterCompareGroup(compareGroupType, conn) -> Json.toJson((for (rCG <- getResultsCG(r.apply(columns.indexOf("filterid")), conn)) yield
+              Json.obj("value" -> rCG.apply(2), "text" -> rCG.apply(1))).toList))
+          }
+
+          standardFiltersJson
+        }
+      }
+    } catch {
+      case exc: Exception =>
+        logger.error(s"Exception while fetching filter config for sponsor ${sponsorId}, filter key ${filterKey}")
+        exc.printStackTrace()
+        null
+    } finally {
+      conn.close()
+    }
+
+  }
+
+  def fetchHierarchicalFilters(sponsorId: String, conn: Connection): JsValue = {
+    /*val iSqlQueryF = s"select filterKey, placeholder, text, value, Hierarchy, filterAlias from _AudienceSvc.FilterConfig where " +
+      s" SponsorId='${sponsorId}'  order by hierarchy asc"*/
+
+
+    val iSqlQueryF = s"select filterKey,placeholder, text, value, Hierarchy, filterAlias, inputAs," +
+      s" isPopular from ${audienceSchema}.FilterConfig fc join ${audienceSchema}.FilterType ft on fc.filtertypeid=ft.id " +
+      s"where ft.FilterType='hierarchical' and fc.SponsorId='${sponsorId}'  order by fc.hierarchy asc"
+    val (columns, results) = executeQuery(conn, iSqlQueryF)
+    if (!results.hasNext) {
+      null
+    } else {
+      val hierFiltersJson = Json.toJson((for (r <- results) yield Json.obj("key" ->
+        r.apply(columns.indexOf("filterKey")), "placeholder" ->
+        r.apply(columns.indexOf("placeholder")), "text" -> r.apply(columns.indexOf("text")),
+        "value" -> r.apply(columns.indexOf("value")), "filterAlias" -> r.apply(columns.indexOf("filterAlias")),
+        "type" -> "hierarchical","inputAs" -> r.apply(columns.indexOf("inputAs")),
+        "isPopular" -> getIsPopularBoolean(r.apply(columns.indexOf("isPopular"))))).toList)
+        /*,"hierarchy" -> r.apply(columns.indexOf("Hierarchy"))*/
+      hierFiltersJson
+    }
+  }
+
+  def fetchStandardFilters(sponsorId: String, conn: Connection): JsValue = {
+    val iSqlQueryF = s"select filterid, filterkey, value, text, filtertype, inputAs, ispopular, filterAlias, "+
+      s" delimiter from ${audienceSchema}.FilterConfig sf join ${audienceSchema}.FilterType ft on sf.filtertypeid=ft.id " +
+      s" where ft.FilterType!='hierarchical' and SponsorId='${sponsorId}'  order by filterid asc "
+    val (columns, results) = executeQuery(conn, iSqlQueryF)
+    if (!results.hasNext) {
+      null
+    } else {
+      var hashMapSFs = scala.collection.immutable.TreeMap[Int, (String, String, String, String, String, String, String, String)]()
+
+      while (results.hasNext) {
+        val r = results.next
+        hashMapSFs=hashMapSFs+ (r.apply(0).toInt -> (r.apply(1), r.apply(2), r.apply(3), r.apply(4), r.apply(5), r.apply(6), r.apply(7), r.apply(8)))
+      }
+      val cgsMap = getFilterCGMap(hashMapSFs.keySet, conn)
+      //println(s"cgsmap ${cgsMap}")
+      val filtersItr = hashMapSFs.keySet.iterator
+      var standardFiltersLB: ListBuffer[JsObject] = new ListBuffer[JsObject]()
+      while (filtersItr.hasNext) {
+        val filterId = filtersItr.next
+        val (filterkey, value, text, filtertype, inputas, ispopular, filteralias, delimiter) = hashMapSFs.getOrElse(filterId, null)
+        val listCGs:List[(String,String)] = cgsMap.getOrElse(filterId, null)
+        var jsonObj = Json.obj("key" -> filterkey, "value" -> value,
+          "text" -> text, "type" -> filtertype,
+          "inputAs" -> inputas, "isPopular" -> getIsPopularBoolean(ispopular),
+          "filterAlias" -> filteralias, "delimiter" -> delimiter)
+        if(listCGs!=null) {
+          val cgsItr = listCGs.iterator
+
+          var MOListBf: ListBuffer[JsObject] = new ListBuffer[JsObject]()
+
+          while (cgsItr.hasNext) {
+            val (cgText, cgValue) = cgsItr.next
+            MOListBf = MOListBf :+ Json.obj("value" -> cgValue, "text" -> cgText)
+
+          }
+          jsonObj = jsonObj + (getFilterCompareGroup(filtertype, conn) ->
+            Json.toJson(MOListBf.toList))
+        }
+        standardFiltersLB = standardFiltersLB :+ jsonObj
+
+
+      }
+      Json.toJson(standardFiltersLB.toList)
+      /*val standardFiltersJson = Json.toJson((for (r <- results) yield
+        Json.obj("key" -> r.apply(columns.indexOf("filterkey")), "value" -> r.apply(columns.indexOf("value")),
+          "text" -> r.apply(columns.indexOf("text")), "type" -> getCompareGroupType(r.apply(columns.indexOf("filtertypeid")), conn),
+          "inputAs" -> r.apply(columns.indexOf("inputAs")), "isPopular" -> getIsPopularBoolean(r.apply(columns.indexOf("ispopular"))),
+          "filterAlias" -> r.apply(columns.indexOf("filterAlias")), "delimiter" -> r.apply(columns.indexOf("delimiter")),
+            getFilterCompareGroup(r.apply(columns.indexOf("filtertypeid")), conn) ->
+            Json.toJson((for (rCG <- getResultsCG(r.apply(columns.indexOf("filterid")), conn)) yield
+            Json.obj("value" -> rCG.apply(2), "text" -> rCG.apply(1))).toList))).toList)
+
+      standardFiltersJson*/
+
+    }
+  }
+
+  def getFilterCGMap(set:scala.collection.Set[Int], conn:Connection):scala.collection.mutable.Map[Int,List[(String,String)]]={
+    val itr=set.iterator
+    var filterIds=new StringBuilder()
+    while(itr.hasNext){
+      filterIds.append(itr.next.toString).append(",")
+    }
+    if(filterIds.length()>=1) {
+      filterIds.delete(filterIds.length() - 1, filterIds.length())
+    }
+    val iSqlQueryCG = s"select filterId,id, text, value from ${audienceSchema}.FilterOptions where " +
+      s" filterId in (${filterIds}) order by filterId,id "
+    //println(s"isqlquerycg ${iSqlQueryCG}")
+    val (columns, results) = executeQuery(conn, iSqlQueryCG)
+    val hashMapCGs=scala.collection.mutable.Map[Int,List[(String,String)]]()
+    while(results.hasNext){
+      val result=results.next
+      if (hashMapCGs.get(result.apply(0).toInt).getOrElse(null) == null) {
+        hashMapCGs.put(result.apply(0).toInt, List((result.apply(2),result.apply(3))))
+      } else {
+        var list=hashMapCGs.get(result.apply(0).toInt).get
+        list=list :+(result.apply(2),result.apply(3))
+
+        hashMapCGs.put(result.apply(0).toInt, list)
+
+      }
+    }
+    hashMapCGs
+  }
+
+  def getIsPopularBoolean(isPopularBit: String): JsBoolean = {
+    if ("1".equals(isPopularBit)) {
+      JsBoolean(true)
+    } else {
+      JsBoolean(false)
+    }
+
+  }
+
+  def getCompareGroupType(filterTypeId: String, conn: Connection): String = {
+    val iSqlQueryF = s"select FilterType from ${audienceSchema}.FilterType where " +
+      s" id=${filterTypeId}  "
+    //println(s"filter select query ${iSqlQueryF}")
+    val (columns, results) = executeQuery(conn, iSqlQueryF)
+    if (results.hasNext) {
+      val result = results.next
+      result.apply(0)
+    } else {
+      null
+    }
+
+  }
+
+  def getResultsCG(filterId: String, conn: Connection): Iterator[IndexedSeq[String]] = {
+    val iSqlQueryCG = s"select Id, text, value from ${audienceSchema}.FilterOptions where " +
+      s" filterId=${filterId} order by id asc "
+    //println(s"cg select query ${iSqlQueryCG}")
+    val (columns, results) = executeQuery(conn, iSqlQueryCG)
+    results
+  }
+
+  def getFilterCompareGroup(filterType: String, conn: Connection): String = {
+
+    //val filterType = getCompareGroupType(filterTypeId, conn)
+    filterType match {
+      case "compare" => "options"//"operators"
+      case "enum" => "options"
+      case _ => //logger.info(s"No options for filtertype ${filterType}")
+        ""
+    }
+  }
+
+  def filterConfigStatus(sponsorId:String, conn:Connection): Boolean ={
+    val audiencesCountSql=s"select top 1 * from ${audienceSchema}.Audiences where sponsorId='${sponsorId}'"
+    val (columns, results) = executeQuery(conn, audiencesCountSql)
+
+    if (results.hasNext) {
+      false
+    }else{
+      true
+    }
+
+  }
+
+  def updateFilterConfig(sponsorId: String, filterKey:String, filterConfig:String):JsValue = {
+    val conn = DriverManager.getConnection(mssqlConfig.Url)
+    try {
+      if(filterConfigStatus(sponsorId,conn)){
+        val filter = Json.parse(filterConfig)
+
+        val placeholderStr = if (filter.as[JsObject].keys.contains("placeholder")) {
+          s"placeholder='${(filter \ ("placeholder")).as[JsString].value}', "
+        } else {
+          ""
+        }
+        val textStr = if (filter.as[JsObject].keys.contains("text")) {
+          s"text='${(filter \ ("text")).as[JsString].value}', "
+        } else {
+          ""
+        }
+        val valueStr = if (filter.as[JsObject].keys.contains("value")) {
+          s"value='${(filter \ ("value")).as[JsString].value}', "
+        } else {
+          ""
+        }
+
+        val filterAliasStr = if (filter.as[JsObject].keys.contains("filterAlias")) {
+          s"filterAlias='${(filter \ ("filterAlias")).as[JsString].value}', "
+        } else {
+          ""
+        }
+
+        /*  val filterType =  if (filter.as[JsObject].keys.contains("type")) {
+          (filter \ ("type")).as[JsString].value
+        }else{
+          null
+        }
+        val inputAs = if (filter.as[JsObject].keys.contains("inputAs")) {
+          (filter \ ("inputAs")).as[JsString].value
+        } else {
+          null
+        }*/
+
+
+        val delimiterStr = if (filter.as[JsObject].keys.contains("delimiter")) {
+          s"delimiter='${(filter \ ("delimiter")).as[JsString].value}', "
+        } else {
+          ""
+        }
+
+        var updStr = placeholderStr + textStr + valueStr + filterAliasStr + delimiterStr
+        if (updStr.length > 1) {
+          updStr = updStr.substring(0, updStr.length - 2)
+        }
+
+        //println(s"updstr ${updStr}")
+        val standardFilterSql = s"update  ${audienceSchema}.FilterConfig set  ${updStr} where  " +
+          s"sponsorId ='${sponsorId}' and filterKey='${filterKey}'"
+        //println(s"standardFilterSql ${standardFilterSql}")
+        val stmtIns: Statement = conn.createStatement()
+        stmtIns.execute(standardFilterSql)
+        val numUpd = stmtIns.getUpdateCount();
+
+        getFilterConfigBySponsorAndKey(sponsorId, filterKey)
+      }else{
+        null
+      }
+      //val isPopular = (filter \ ("isPopular")).as[JsBoolean].value
+      //val filterTypeId: Int = findFilterTypeId(filterType, conn)
+
+      /*val filterType = ((jsonFilter) \ ("type")).as[JsString].value
+      if ("hierarchical".equals(filterType)) {
+        updateHierarchicalFilter(sponsorId, jsonFilter, conn)
+      } else {
+        updateStandardFilter(sponsorId,jsonFilter, conn)
+      }*/
+      //conn.commit()
+    } catch {
+      case exc: Exception =>
+        logger.error("Exception while updating filter",exc)
+        throw exc
+    } finally {
+      conn.close()
+    }
+
+  }
+
+ /* def updateHierarchicalFilter(sponsorId: String, filterKey: String, conn:Connection): String ={
+    val hierFilterSql = s"delete from ${audienceSchema}.HierarchicalFilter OUTPUT deleted.FilterId  where '"
+    //println(s"hierFilterSql ${hierFilterSql}")
+    val (columns, results) = executeQuery(conn, hierFilterSql)
+    var filterId:String=null
+    while(results.hasNext){
+      filterId=results.next.apply(0)
+    }
+    if(filterId!=null){
+      filterId
+    }else{
+      throw new Exception(s"Hierarchical Filter not found with sponsorid ${sponsorId} and filter key ${filterKey}")
+    }
+
+  }
+*/
+  def updateHierarchicalFilter( sponsorId: String, filter: JsValue, conn: Connection): Unit = {
+
+    val filterKey = ((filter) \ ("key")).as[JsString].value
+
+    val (placeholder,text,value, filterAlias) = createHierarchicalFilterUpdate(filter)
+
+   /* var inserts: String = null
+    if (insertsSB.length >= 1) {
+      inserts = insertsSB.substring(0, insertsSB.length - 1).toString()
+    }*/
+    val hierFilterSql = s"update  ${audienceSchema}.HierarchicalFilter set " +
+      s" placeholder='${placeholder}', text='${text}', value='${value}', filterAlias='${filterAlias}'  where" +
+      s" sponsorId ='${sponsorId}' and filterKey='${filterKey}'"
+    //println(s"hierFilterSql ${hierFilterSql}")
+    val stmtIns: Statement = conn.createStatement()
+    stmtIns.execute(hierFilterSql)
+    val numUpd = stmtIns.getUpdateCount();
+    if(numUpd==0) {
+      //persistHierarchicalFilter(sponsorId, filter, conn)
+    }
+
+  }
+
+  def persistHierarchicalFilter(sponsorId: String,filter: JsValue, conn: Connection): Unit = {
+
+
+    val res = createHierarchicalFilterInsert(filter, 0, sponsorId, conn)
+
+
+    val hierFilterSql = s"insert into ${audienceSchema}.HierarchicalFilter(sponsorId, hierarchy, placeholder, text, value, " +
+      s"filterKey, filterAlias)  Values ${res}"
+    //println(s"hierFilterSql ${hierFilterSql}")
+    val stmtIns: Statement = conn.createStatement()
+    stmtIns.execute(hierFilterSql)
+
+  }
+
+
+
+
+  def createHierarchicalFilterUpdate(filter: JsValue): (String, String, String, String) = {
+    //println(s"hierarchical filter $filter i $i")
+    val placeholder = (filter \ ("placeholder")).as[JsString].value
+    val text = (filter \ ("text")).as[JsString].value
+    val value = (filter \ ("value")).as[JsString].value
+    val filterAlias = (filter \ ("filterAlias")).as[JsString].value
+
+    (placeholder, text, value, filterAlias)
+  }
+
+  /*def StandardFilter(sponsorId: String, jsonFilter: String, conn:Connection): String ={
+    val standardFilterSql = s"select filterId from ${audienceSchema}.StandardFilter   where sponsorId ='${sponsorId}' and filterKey='${filterKey}''"
+    //println(s"hierFilterSql ${hierFilterSql}")
+    val (columns, results) = executeQuery(conn, standardFilterSql)
+    var filterId:String=null
+    while(results.hasNext){
+      filterId =results.next.apply(0)
+    }
+    if(filterId!=null) {
+      deleteFilterCGs(filterId)
+      val standardFilterSql = s"delete from ${audienceSchema}.StandardFilter   where sponsorId ='${sponsorId}' and filterKey='${filterKey}'"
+      //println(s"hierFilterSql ${hierFilterSql}")
+      executeQuery(conn, standardFilterSql)
+      filterId
+    }else{
+      throw new Exception(s"Standard Filter not found with sponsorid ${sponsorId} and filter key ${filterKey}")
+    }
+
+  }*/
+
+  def updateStandardFilter(sponsorId: String, filter: JsValue, conn: Connection): Unit = {
+    //println(s"standard filter $filter")
+    val key = (filter \ ("key")).as[JsString].value
+    val value = (filter \ ("value")).as[JsString].value
+    val text = (filter \ ("text")).as[JsString].value
+    val filterType = (filter \ ("type")).as[JsString].value
+    val inputAs = if (filter.as[JsObject].keys.contains("inputAs")) {
+      (filter \ ("inputAs")).as[JsString].value
+    } else {
+      null
+    }
+    val filterAlias = if (filter.as[JsObject].keys.contains("filterAlias")) {
+      (filter \ ("filterAlias")).as[JsString].value
+    } else {
+      null
+    }
+
+    val delimiter = if (filter.as[JsObject].keys.contains("delimiter")) {
+      (filter \ ("delimiter")).as[JsString].value
+    } else {
+      null
+    }
+    val isPopular = (filter \ ("isPopular")).as[JsBoolean].value
+    val filterTypeId: Int = findFilterTypeId(filterType, conn)
+
+    //val filterId =
+    //println(s"updating standard filter obj sponsorid ${sponsorId}, filter key ${key}, inputAs ${inputAs}")
+
+    val numUpd=updateStandardFilterObject(sponsorId, key, value, text, filterTypeId, inputAs, isPopular, filterAlias,
+      delimiter, conn)
+    if(numUpd==0) {
+      //saveStandardFilter( filter,sponsorId, conn)
+    }
+    /*filterType match {
+      case "compare" => val operators = (filter \ ("operators")).as[JsArray]
+        saveFilterCompareGroups(operators, filterId, conn)
+      case "enum" => val options = (filter \ ("options")).as[JsArray]
+        saveFilterCompareGroups(options, filterId, conn)
+      case _ => logger.info(s"No options for filtertype ${filterType}")
+    }*/
+  }
+
+
+
+  def updateStandardFilterObject(sponsorId: String, key: String, value: String, text: String, filterTypeId: Int,
+                            inputAs: String, isPopular: Boolean, filterAlias:String, delimiter:String,
+                                 conn: Connection): Int = {
+    var isPopularBit: Int = 0
+    if (isPopular == true) {
+      isPopularBit = 1
+    }
+    val standardFilterSql = s"update  ${audienceSchema}.StandardFilter set  value='${value}', text='${text}', " +
+      s" filtertypeid=${filterTypeId}, inputas='${inputAs}', ispopular=${isPopularBit} , filterAlias='${filterAlias}'," +
+      s" delimiter='${delimiter}' where  sponsorId ='${sponsorId}' and filterKey='${key}'"
+    //println(s"standardFilterSql ${standardFilterSql}")
+    val stmtIns: Statement = conn.createStatement()
+    stmtIns.execute(standardFilterSql)
+    val numUpd = stmtIns.getUpdateCount();
+    numUpd
+    /*if (results.hasNext) {
+      val result = results.next()
+      result.apply(0).toInt
+    } else {
+      throw new Exception(s"Standard filter config could not be created for sponsor ${sponsorId}")
+    }*/
+
+  }
+
+
+
+
+  def updateHierarchicalFilterOrder(sponsorId:String, filterConfig:String):JsObject={
+    val conn = DriverManager.getConnection(mssqlConfig.Url)
+    conn.setAutoCommit(false)
+    try {
+      if(filterConfigStatus(sponsorId,conn)) {
+        val jsonFilter = Json.parse(filterConfig)
+        val filters = (jsonFilter \ ("hierarchical")).as[JsArray]
+        var i = 0
+        while (i < filters.value.size) {
+          val filter: JsLookupResult = filters.apply(i)
+          val res = hierFilterUpdatehierarchy(((filter.get) \ ("key")).as[JsString].value, i + 1, sponsorId, conn)
+          //insertsSB = insertsSB.append(res).append(",")
+          i += 1
+        }
+        /* updateHierarchicalFilter(sponsorId, jsonFilter, conn)
+     } else {
+       updateStandardFilter(sponsorId,jsonFilter, conn)
+     }*/
+        conn.commit()
+        jsonFilter.as[JsObject]
+        //getFilterConfigBySponsor(null,sponsorId)
+      }else{
+        null
+      }
+    } catch {
+      case exc: Exception =>
+        logger.error(s"Exception while updating hierarchical filter order for sponsor id ${sponsorId}")
+        exc.printStackTrace()
+        conn.rollback()
+        throw exc
+    } finally {
+      conn.close()
+    }
+  }
+
+  def hierFilterUpdatehierarchy( filterKey:String, hierarchy:Int, sponsorId:String, conn:Connection):Unit= {
+    val hierFilterSql = s"update  ${audienceSchema}.FilterConfig set " +
+      s" hierarchy='${hierarchy}'  where" +
+      s" sponsorId ='${sponsorId}' and filterKey='${filterKey}' and filterTypeId= " +
+      s"(select Id from ${audienceSchema}.FilterType where filterType='hierarchical')"
+    val stmtUpd: Statement = conn.createStatement()
+    stmtUpd.execute(hierFilterSql)
+    val numUpd = stmtUpd.getUpdateCount();
+    if(numUpd==0){
+      throw new Exception(s"Hierarchical Filters hierarchy coluld not be updated for " +
+        s"Sponsor Id ${sponsorId} and key ${filterKey}")
+    }
+
+    None
+  }
+
+}

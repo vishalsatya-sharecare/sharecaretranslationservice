@@ -1,0 +1,18 @@
+FROM 1science/sbt:0.13.8-oracle-jre-8 as builder
+WORKDIR /app
+COPY . .
+
+RUN mkdir -p /root/.ivy2
+RUN cp .credentials /root/.ivy2/.credentials
+RUN sbt update -Dsbt.boot.credentials=$HOME/.ivy2/.credentials
+RUN rm -f /root/.ivy2/.credentials
+
+# Stage two of the build
+FROM alpine:latest
+
+RUN mkdir -p /root/.ivy2
+RUN mkdir -p /root/.sbt
+
+# Copy over ivy and sbt caches
+COPY --from=builder /root/.ivy2 /root/.ivy2
+COPY --from=builder /root/.sbt /root/.sbt

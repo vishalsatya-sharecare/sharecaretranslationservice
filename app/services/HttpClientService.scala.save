@@ -1,0 +1,24 @@
+package services
+import java.io._
+
+import org.apache.http.HttpEntity
+import org.apache.http.HttpResponse
+import org.apache.http.client.ClientProtocolException
+import org.apache.http.client.HttpClient
+import org.apache.http.client.methods.HttpGet
+import org.apache.http.impl.client.{DefaultHttpClient, HttpClientBuilder}
+class HttpClientService {
+  def getRestContent(url:String): String = {
+    val httpClient = HttpClientBuilder.create()
+    val httpResponse = httpClient.execute(new HttpGet(url))
+    val entity = httpResponse.getEntity()
+    var content = ""
+    if (entity != null) {
+      val inputStream = entity.getContent()
+      content = io.Source.fromInputStream(inputStream).getLines.mkString
+      inputStream.close
+    }
+    httpClient.getConnectionManager().shutdown()
+    return content
+  }
+}

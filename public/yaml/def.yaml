@@ -1,0 +1,57 @@
+responses:
+  200:
+    description: Success!
+  400:
+    description: Bad Request. Something wrong on client's end.
+    examples:
+      application/json:
+        {
+          "error": "client error",
+          "status": 400
+        }
+  401:
+    description: authorization failed
+    examples:
+      application/json:
+        {
+          "error": "Unauthorized : Authentication is possible but has failed or not yet been provided.",
+          "status": 401
+        }
+  404:
+    description: Record not found
+    examples:
+      application/json:
+        {
+          "error": "resource does not exist",
+          "status": 404
+        }
+  500:
+    description: Internal Server Error. Something went wrong on API's end.
+    examples:
+      application/json:
+        {
+          "error": "server error",
+          "status": 500
+        }
+
+headers:
+  xFlowId:
+    name: X-Flow-ID
+    in: header
+    type: string
+    description: >
+      The X-Flow-ID header. If provided, this value must be unique per request;
+      otherwise, one will be generated. This header will also be present in service
+      responses.
+  authorizationDeprecated:
+    required: true
+    name: Authorization
+    in: header
+    type: string
+    description: SSO Authentication {token}
+  authorization:
+    name: Authorization
+    in: header
+    description: SSO {auth token} OR Basic {base64 user:pass}
+    required: true
+    type: string

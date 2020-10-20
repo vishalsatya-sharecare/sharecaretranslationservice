@@ -1,0 +1,48 @@
+pipeline:
+  mount-cache:
+    ## TODO - Change `dhs-audience-service` to your project name
+    # for this to work, you need to run conf/build_deps_cache.sh
+    # and also login to nexus.admin.sharecare.com via docker
+    # docker login -u [your.username] -p [password] nexus.admin.sharecare.com
+    image: nexus.admin.sharecare.com/health-profile-deps-cache:1.0
+    commands:
+    - cp -a /root/.ivy2 .
+    - cp -a /root/.sbt .
+
+  assemble:
+    image: gempesaw/docker-sbt:0.13.11
+    commands:
+    - yes | cp -rf .ivy2/* /root/.ivy2/
+    - yes | cp -rf .sbt/* /root/.sbt/
+    - mkdir -p $HOME/.sbt/0.13/plugins/
+    - cp /secrets/credentials.sbt $HOME/.sbt/0.13/plugins/plugins.sbt
+    - cp /secrets/.credentials $HOME/.ivy2/
+    # libstdc++ is required for sass compilation
+    - apk update
+    - apk add --no-cache libstdc++
+    - sbt test universal:packageZipTarball -Dsbt.boot.credentials=/secrets/.credentials -Dsbt.override.build.repos=true -Dsbt.repository.config=project/repositories
+    - tar xvzf target/universal/dhs-audience-service.tgz
+
+  docker:
+    image: nexus.admin.sharecare.com/drone-nexus-docker
+    version: awk -F:= '{if ($1 ~ /\ +version/) print $2 }' build.sbt | sed  's/"//g' | sed 's/\ //g' | sed 's/,//g'
+    when:
+      event: [ push ]
+      branches: [ feature/*, develop, master ]
+
+  nexusPublish:
+    image: nexus.admin.sharecare.com/drone-nexus-docker
+    version: awk -F:= '{if ($1 ~ /\ +version/) print $2 }' build.sbt | sed  's/"//g' | sed 's/\ //g' | sed 's/,//g'
+
+  archive:
+    image: nexus.admin.sharecare.com/drone-build-plugin
+    when:
+      status: [ success, failure ]
+
+  teams:
+    image: nexus.admin.sharecare.com/drone-teams-notification
+    # ShareCare -> HealthProfile (UPP) -> Build Notifications
+    webhook: "https://outlook.office.com/webhook/c7664819-ac7b-4e8f-82ce-0a1fbf7ab62f@4791286b-0707-4782-8dae-89fe4a320b09/IncomingWebhook/a36a2b2baba64c58ade636a5fead4b0c/c7774ebc-245d-4d76-bbc6-7fcd7ebb0585"
+    when:
+      status: [ success, failure ]
+      local: false

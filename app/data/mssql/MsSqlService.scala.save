@@ -1,0 +1,866 @@
+package data.mssql
+
+import java.sql.{ResultSet, SQLException, Statement}
+import java.sql.SQLException
+import scala.util.{Failure, Success, Try}
+import javax.inject.{Inject, Singleton}
+import play.api.Configuration
+import play.api.inject.ApplicationLifecycle
+import utils.scaffolds.Logging
+import play.api.libs.json.{JsArray, JsObject, JsString, Json, JsValue}
+import utils.helpers.RuleParser
+import services._
+import scala.concurrent.Future
+import scala.collection.mutable
+import scala.collection.mutable.ListBuffer
+import scala.concurrent.ExecutionContext.Implicits.global
+import java.security.MessageDigest
+import java.math.BigInteger
+import data.memcached.AudienceStatistics._
+import scala.util.control.Breaks._
+@Singleton
+class MsSqlService @Inject()(lifecycle: ApplicationLifecycle, config: Configuration, akkaService: AkkaService
+                             , memcachedService:MemcachedService)
+  extends Logging with DHSServiceable {
+
+  import java.sql.{Connection, DriverManager}
+
+  val mssqlConfig             = MsSql.ApplicationConfiguration(config)
+
+  val audienceSchema          = getAudienceSchema()
+
+  //  val sponsors: mutable.HashMap[String, String] = mutable.HashMap.empty[String, String]
+
+  DriverManager.registerDriver(new net.sourceforge.jtds.jdbc.Driver)
+
+  var roConnection: Connection = readOnlyConnection()
+
+  var sponsorFieldMappingsRead:mutable.HashMap[String, mutable.HashMap[String, String]]=null
+
+  def readSponsorFieldMappings(): mutable.HashMap[String, mutable.HashMap[String, String]] = {
+    val sponsorFieldMappings: mutable.HashMap[String, mutable.HashMap[String, String]] = mutable.HashMap.empty[String, mutable.HashMap[String,String]]
+
+    val sqlQuery = s"SELECT *\nFROM ${audienceSchema}.SponsorFieldMappings"
+    val (columns, results) = executeQuery(readOnlyConnection(), sqlQuery)
+
+    while (results.hasNext) {
+      val entry = results.next()
+      val sponsorId = entry.apply(columns.indexOf("SponsorId"))
+
+      if (!sponsorFieldMappings.contains(sponsorId)) {
+        sponsorFieldMappings(sponsorId) = mutable.HashMap.empty[String, String]
+      }
+
+      sponsorFieldMappings(sponsorId) += (entry.apply(columns.indexOf("SourceField")) -> entry.apply(columns.indexOf("TargetField")))
+    }
+
+    sponsorFieldMappingsRead=sponsorFieldMappings
+    sponsorFieldMappings
+  }
+
+  def deleteAudienceEligGuid(guid: String): JsObject = {
+
+    if (guid == "") {
+      Json.obj("statusCode" -> 400, "message" -> "Missing Guid for delete")
+    } else {
+
+      val eligTable = getEligTable("SC_CONSUMER")
+      val sponsorSchema = getSponsorSchema("SC_CONSUMER")
+
+      val connection = DriverManager.getConnection(mssqlConfig.Url)
+
+      try {
+
+        connection.setAutoCommit(false)
+
+        val deleteMemberAudienceStmt = connection.prepareStatement(s"DELETE FROM ${audienceSchema}.MemberAudiences WHERE Guid=?")
+        val deleteEligStmt = connection.prepareStatement(s"DELETE FROM ${sponsorSchema}.${eligTable} WHERE Guid=?")
+
+        deleteMemberAudienceStmt.setString(1, guid)
+        deleteMemberAudienceStmt.executeUpdate()
+
+        deleteEligStmt.setString(1, guid)
+        deleteEligStmt.executeUpdate()
+
+        connection.commit()
+
+      } finally {
+        connection.close()
+      }
+
+      Json.obj("statusCode" -> 200)
+    }
+  }
+
+  def getAudienceMembership(guid: String, sponsorId: Option[String]): JsObject = {
+
+    var sqlGuidCheckQuery = ""
+    var sqlQuery = ""
+
+    if (sponsorId.isEmpty) {
+      val sponsorSchema = getSponsorSchema("SC_CONSUMER")
+      val eligTable = getEligTable("SC_CONSUMER")
+
+
+      sqlGuidCheckQuery = s"SELECT TOP 1 Guid FROM ${sponsorSchema}.${eligTable} WHERE Guid=${guid}"
+      sqlQuery = s"SELECT SponsorId, AudienceId FROM ${audienceSchema}.MemberAudiences WHERE Guid=${guid}"
+
+    } else {
+
+      val sponsorSchema = getSponsorSchema(sponsorId.mkString)
+      val eligTable = getEligTable(sponsorId.mkString)
+
+      sqlGuidCheckQuery = s"SELECT TOP 1 Guid FROM ${sponsorSchema}.${eligTable} WHERE SponsorId='${sponsorId.mkString}' AND Guid=${guid}"
+      sqlQuery = s"SELECT SponsorId, AudienceId FROM ${audienceSchema}.MemberAudiences WHERE SponsorId='${sponsorId.mkString}' AND Guid=${guid}"
+
+    }
+
+    val (columns, results) = executeQuery(readOnlyConnection(), sqlQuery)
+
+    if (results.hasNext) {
+
+      val (aColumns, aResults) = executeQuery(readOnlyConnection(), sqlQuery)
+
+      Json.obj("statusCode" -> 200, "response" -> Json.obj("audiences" -> Json.toJson((for (result <- aResults) yield Json.obj(("audienceId" -> result.apply(aColumns.indexOf("AudienceId"))), ("sponsorId" -> result.apply(aColumns.indexOf("SponsorId"))))).toList)))
+    } else {
+      Json.obj("statusCode" -> 404, "message" -> s"Unknown Guid ${guid}")
+    }
+  }
+
+  def swapAudienceEligGuid(swapGuids: String): JsObject = {
+    val jsonSwapGuid = Json.parse(swapGuids)
+
+    var fromGuid = ""
+    var toGuid = ""
+    try {
+      fromGuid = ((jsonSwapGuid) \ ("fromGuid")).as[JsString].value
+      toGuid = ((jsonSwapGuid) \ ("toGuid")).as[JsString].value
+    } catch {
+      case exc:Exception => {}
+    }
+
+    if (fromGuid == "") {
+      Json.obj("statusCode" -> 400, "message" -> "Missing fromGuid for swap")
+    } else if (toGuid == "") {
+      Json.obj("statusCode" -> 400, "message" -> "Missing toGuid for swap")
+    }
+    else {
+      val eligTable = getEligTable("SC_CONSUMER")
+      val sponsorSchema = getSponsorSchema("SC_CONSUMER")
+
+      val connection = DriverManager.getConnection(mssqlConfig.Url)
+
+      try {
+
+        connection.setAutoCommit(false)
+
+        val updateMemberAudienceStmt = connection.prepareStatement(s"UPDATE ${audienceSchema}.MemberAudiences SET Guid=? WHERE Guid=?")
+        val updateEligStmt = connection.prepareStatement(s"UPDATE ${sponsorSchema}.${eligTable} SET Guid=? WHERE Guid=?")
+
+        updateMemberAudienceStmt.setString(1, toGuid)
+        updateMemberAudienceStmt.setString(2, fromGuid)
+        updateMemberAudienceStmt.executeUpdate()
+
+        updateEligStmt.setString(1, toGuid)
+        updateEligStmt.setString(2, fromGuid)
+        updateEligStmt.executeUpdate()
+
+        connection.commit()
+
+      } finally {
+        connection.close()
+      }
+      Json.obj("statusCode" -> 200)
+    }
+
+  }
+
+
+  def audienceMembership(rules: String): JsObject = {
+
+    val jsonRules = Json.parse(rules)
+    val sponsorId = ((jsonRules) \ ("sponsorId")).as[JsString].value
+    val guid = ((jsonRules) \ ("externalIdentifier")).as[JsString].value
+
+    if (guid == "") {
+      Json.obj("statusCode" -> 400, "message" -> "Empty or Missing externalIdentifier")
+    } else {
+
+      val eligTable = getEligTable(sponsorId)
+      val eligMiscJoin = getEligMiscJoin(sponsorId)
+
+      // Check if the request is for a community sponsor
+      if (isAudienceMembershipSupported(sponsorId)) {
+
+        val connection = DriverManager.getConnection(mssqlConfig.Url)
+        connection.setAutoCommit(false)
+        try {
+          //          val today = DateTimeFormatter.ofPattern("yyyy-MM-dd").format(LocalDate.now())
+          // Due to timezone issue using epoch start instead of current date
+          val sponsorSchema = getSponsorSchema(sponsorId)
+          val sponsorFieldMappings: mutable.HashMap[String, mutable.HashMap[String, String]] = readSponsorFieldMappings()
+          val demValCols = RuleParser.parseMembershipRuleMap(rules, sponsorFieldMappings.apply(sponsorId))
+          val eligColVals = List(("RecordStatus", "C"), ("CustomerID", s"${sponsorId}"), ("Guid", s"${guid}"), ("EligibilityStartDate", s"1970-01-01"), ("EligibilityEndDate", s"9999-12-31")) ::: demValCols
+
+          // Cleanup as necessary when the sponsor is a Consumer/Community sponsor
+          val cleanUpCondition = if (isConsumerSponsor(sponsorId)) "!" else ""
+
+          val cleanUpMemberAudiencesStmt = connection.prepareStatement(s"DELETE FROM ${audienceSchema}.MemberAudiences WHERE SponsorId ${cleanUpCondition}='SC_CONSUMER' AND guid=${guid}")
+          val cleanUpEligStmt = connection.prepareStatement(s"DELETE FROM ${sponsorSchema}.${eligTable} WHERE CustomerId ${cleanUpCondition}='SC_CONSUMER' AND guid=${guid}")
+          cleanUpMemberAudiencesStmt.executeUpdate()
+          cleanUpEligStmt.executeUpdate()
+
+          val updatePhrase = (for ((k, v) <- demValCols) yield s"ut.${k}=us.${k}").mkString(", ")
+          val keyPhrase = (for ((k, v) <- eligColVals) yield s"${k}").mkString(", ")
+          val valuePhrase = (for ((k, v) <- eligColVals) yield s"'${v}'")
+          val subValuePhrase = (for ((k, v) <- eligColVals) yield s"'${v}'").mkString(", ")
+          val sqlEligRecord2 = s"(SELECT " + (for ((k, v) <- eligColVals) yield s"'${v}' as ${k}").mkString(", ") + ") "
+
+          // Upsert Query
+          val sqlEligUpsert = s"MERGE INTO ${sponsorSchema}.${eligTable} as ut\nUSING ${sqlEligRecord2} as us\nON ut.guid=us.guid AND ut.CustomerId=us.CustomerId\nWHEN MATCHED THEN\nUPDATE SET ${updatePhrase}\nWHEN NOT MATCHED THEN\nINSERT (${keyPhrase}) VALUES (${subValuePhrase});"
+          val sqlEligUpsertStmt = connection.prepareStatement(sqlEligUpsert)
+          //        for((v, i) <- valuePhrase.view.zipWithIndex) sqlEligUpsertStmt.setString(i+1, v)
+          sqlEligUpsertStmt.executeUpdate()
+
+          // Create Entries in MemberAudiences
+          val sqlDeleteMemberAudiencesStmt = connection.prepareStatement(s"DELETE FROM ${audienceSchema}.MemberAudiences WHERE SponsorId=? AND Guid=?")
+          sqlDeleteMemberAudiencesStmt.setString(1, sponsorId)
+          sqlDeleteMemberAudiencesStmt.setString(2, guid)
+          sqlDeleteMemberAudiencesStmt.executeUpdate()
+
+          val sqlMemberAudiences = s"SELECT CONCAT(REPLACE(RuleSql, 'INSERT INTO ${audienceSchema}.MemberAudiences (EligId, Guid, SponsorId, StartDate, EndDate, AudienceId)', ''), ' AND Guid=${guid}') as AudienceRuleSql FROM ${audienceSchema}.Audiences WHERE SponsorId='${sponsorId}'"
+          val (columns, results) = executeQuery(connection, sqlMemberAudiences)
+
+          // Return AudienceIds
+          if (results.hasNext) {
+            val insertMemberAudiences = s"INSERT INTO ${audienceSchema}.MemberAudiences (EligId, Guid, SponsorId, StartDate, EndDate, AudienceId) " + (for (result <- results) yield result.apply(columns.indexOf("AudienceRuleSql"))).mkString(s" AND E.Guid=${guid} UNION ")
+            val sqlMemberAudiencesStmt = connection.prepareStatement(insertMemberAudiences)
+            sqlMemberAudiencesStmt.executeUpdate()
+          }
+
+          val (aColumns, aResults) = executeQuery(connection, s"SELECT SponsorId, AudienceId FROM ${audienceSchema}.MemberAudiences WHERE SponsorId='${sponsorId}' AND Guid=${guid}")
+          connection.commit()
+
+          Json.obj("statusCode" -> 200, "response" -> Json.obj("audiences" -> Json.toJson((for (result <- aResults) yield Json.obj(("audienceId" -> result.apply(aColumns.indexOf("AudienceId"))), ("sponsorId" -> result.apply(aColumns.indexOf("SponsorId"))))).toList)))
+          //          Json.obj("audiences" -> Json.toJson((for (result <- aResults) yield Json.obj(("audienceId" -> result.apply(aColumns.indexOf("AudienceId"))))).toList))
+
+          //      val sqlEligRecord = s"(SELECT " + (for ((k, v) <- eligColVals) yield s"''${v}'' as ${k}").mkString(", ") + ") E "
+          //      val audienceRuleSqls = s"SELECT REPLACE(\n           REPLACE(\n                   REPLACE(RuleSql,\n                           'INSERT INTO _AudienceSvc.MemberAudiences (EligId, Guid, SponsorId, StartDate, EndDate, AudienceId)',\n                           ''),\n               CONCAT('E.Id, Guid, ''', SponsorId, ''', ''', StartDate, ''', ''', EndDate, ''', ''', AudienceId, ''''),\n               CONCAT('''', SponsorId, ''' as SponsorId, ''', StartDate, ''' as StartDate, ''', EndDate, ''' as EndDate, ''', AudienceId, ''' as AudienceId')\n               ),\n           '${sponsorSchema}.${eligTable} E\n${eligMiscJoin}', '${sqlEligRecord}') as AudienceRuleSql\nFROM _AudienceSvc.Audiences WHERE SponsorId='${sponsorId}'"
+          //      val (columns, results) = executeQuery(readOnlyConnection(), audienceRuleSqls)
+          //      val matchingAudiences = (for (result <- results) yield result.apply(columns.indexOf("AudienceRuleSql"))).mkString(" UNION ")
+          //      val (aColumns, aResults) = executeQuery(readOnlyConnection(), matchingAudiences)
+
+
+          //      Json.obj("audiences" -> Json.toJson((for (result <- aResults) yield Json.obj(("audienceId" -> result.apply(aColumns.indexOf("AudienceId"))))).toList))
+
+
+        } finally {
+          connection.close()
+        }
+
+      } else {
+        Json.obj("statusCode" -> 200, "response" -> Json.obj("audiences" -> Json.toJson(List.empty[String])))
+      }
+    }
+  }
+
+
+  def getAudienceData(audienceId: String): (String,String,String,String) = {
+
+    val sqlQuery = s"SELECT A.SponsorId as sponsorId,A.startDate as startDate, A.endDate as endDate, A.AudienceId as audienceId, A.[Rule] as jsonAudience \nFROM ${audienceSchema}.Audiences A\n WHERE AudienceId='${audienceId.mkString}'"
+    val (columns, results) = executeQuery(readOnlyConnection(), sqlQuery)
+
+
+    if (results.hasNext) {
+
+      val result = results.next()
+      val sponsorId = result.apply(columns.indexOf("sponsorId"))
+      val startDate=result.apply(columns.indexOf("startDate"))
+      val endDate=result.apply(columns.indexOf("endDate"))
+      val jsonAudience=result.apply(columns.indexOf("jsonAudience"))
+      (sponsorId,startDate,endDate,jsonAudience)
+    }else{
+      (null,null,null,null)
+    }
+
+
+  }
+  def retrieveAudience(audienceId: String): JsObject = {
+
+    //    val sqlQuery = s"SELECT A.SponsorId as sponsorId, A.AudienceId as audienceId, COALESCE(count(DISTINCT Ma.Guid), 0) as count\nFROM ${audienceSchema}.Audiences A\nLEFT JOIN ${audienceSchema}.MemberAudiences MA ON A.AudienceId=MA.AudienceId\nWHERE A.AudienceId='${audienceId.mkString}'\nGROUP BY A.AudienceId, A.SponsorId"
+    val sqlQuery = s"SELECT A.SponsorId as sponsorId, A.AudienceId as audienceId, MA.count\nFROM ${audienceSchema}.Audiences A\nJOIN (SELECT '${audienceId.mkString}' as AudienceId, count(DISTINCT Guid) as count FROM ${audienceSchema}.MemberAudiences WHERE AudienceId='${audienceId.mkString}') MA ON A.AudienceId=MA.AudienceId"
+    val (columns, results) = executeQuery(readOnlyConnection(), sqlQuery)
+
+    if (results.hasNext) {
+
+      val result = results.next()
+      val audienceCount = ("count" -> Json.toJson(result.apply(columns.indexOf("count"))))
+      val sponsorId = result.apply(columns.indexOf("sponsorId"))
+      val eligTable = getEligTable(sponsorId)
+
+      val overlapSqlQuery = s"SELECT MA.AudienceId as audienceId, count(DISTINCT MA.Guid) as overlaps\nFROM ${audienceSchema}.MemberAudiences MA\nJOIN ${audienceSchema}.Audiences A ON A.SponsorId=MA.SponsorId\nJOIN ${audienceSchema}.MemberAudiences MA2 ON MA2.AudienceId=A.AudienceId\nWHERE A.AudienceId='${audienceId}'\nAND MA.AudienceId != '${audienceId}'\nAND MA.Guid=MA2.Guid\nGROUP BY MA.AudienceId"
+      val (columns2, results2) = executeQuery(readOnlyConnection(), overlapSqlQuery)
+      val counts = Json.obj("overlaps" -> Json.toJson((for (r <- results2) yield Json.obj("audienceId" -> r.apply(columns2.indexOf("audienceId")), "overlaps" -> r.apply(columns2.indexOf("overlaps")))).toList))
+
+      val netOverlapSqlQuery = s"SELECT count(DISTINCT MA.Guid) as netOverlapCount\nFROM ${audienceSchema}.MemberAudiences MA\nJOIN ${audienceSchema}.Audiences A ON A.SponsorId=MA.SponsorId\nJOIN ${audienceSchema}.MemberAudiences MA2 ON MA2.AudienceId=A.AudienceId\nWHERE A.AudienceId='${audienceId}'\nAND MA.AudienceId != '${audienceId}'\nAND MA.Guid=MA2.Guid"
+      val (columns4, results4) = executeQuery(readOnlyConnection(), netOverlapSqlQuery)
+
+      val sponsorSchema = getSponsorSchema(sponsorId)
+      //      val totalCountSqlQuery = s"SELECT count(DISTINCT E.Guid) as totalPopulationCount\nFROM ${sponsorSchema}.${eligTable} E\nJOIN ${sponsorSchema}.EligMisc EM ON E.Id=EM.EligId\nJOIN ${audienceSchema}.Audiences A ON E.CustomerId=A.SponsorId\nWHERE E.RecordStatus IN ('C', 'Z')\nAND A.AudienceId='${audienceId.mkString}'"
+      val totalCountSqlQuery = s"SELECT count(DISTINCT E.Guid) as totalPopulationCount\nFROM ${sponsorSchema}.${eligTable} E\nWHERE E.RecordStatus IN ('C', 'Z') AND E.CustomerId='${sponsorId}'"
+      val (columns3, results3) = executeQuery(readOnlyConnection(), totalCountSqlQuery)
+      counts + audienceCount + ("totalPopulationCount" -> Json.toJson(results3.next().apply(columns3.indexOf("totalPopulationCount")))) + ("netOverlapCount" -> Json.toJson(results4.next().apply(columns4.indexOf("netOverlapCount"))))
+    } else {
+      null
+    }
+  }
+
+  def retrieveAudiences(sponsorId: Option[String]): JsObject = {
+    val sponsorSchema = getSponsorSchema(sponsorId.get)
+    val eligTable = getEligTable(sponsorId.get)
+    val eligMiscJoin = getEligMiscJoin(sponsorId.get)
+
+    //    val sqlQuery = s"SELECT A.AudienceId as audienceId, count(DISTINCT Ma.Guid) as count\nFROM ${audienceSchema}.Audiences A\nLEFT JOIN ${audienceSchema}.MemberAudiences MA ON A.AudienceId=MA.AudienceId\nWHERE A.SponsorId='${sponsorId.mkString}'\nGROUP BY A.AudienceId"
+    val sqlQuery = s"SELECT A.AudienceId as audienceId, COALESCE(count, 0) as count FROM ${audienceSchema}.Audiences A\nLEFT JOIN\n(SELECT AudienceId, count(distinct Guid) as count FROM ${audienceSchema}.MemberAudiences MA Group by AudienceId) MA ON A.AudienceId=MA.AudienceId\nWHERE A.SponsorId='${sponsorId.mkString}'"
+    val (columns, results) = executeQuery(readOnlyConnection(), sqlQuery)
+
+    if (results.hasNext) {
+      val retJson = Json.obj("audiences" -> Json.toJson((for (r <- results) yield Json.obj("audienceId" -> r.apply(columns.indexOf("audienceId")), "count" -> r.apply(columns.indexOf("count")))).toList))
+
+      val sqlQuery2 = s"SELECT count(DISTINCT Ma.Guid) as totalAudiencesCount\nFROM ${audienceSchema}.Audiences A\nJOIN ${audienceSchema}.MemberAudiences MA ON A.AudienceId=MA.AudienceId\nWHERE A.SponsorId='${sponsorId.mkString}'"
+      val (columns2, results2) = executeQuery(readOnlyConnection(), sqlQuery2)
+
+      val sqlQuery3 = s"SELECT count(distinct E.Guid) as totalPopulationCount\nFROM ${sponsorSchema}.${eligTable} E\nWHERE E.RecordStatus IN ('C', 'Z') AND E.CustomerId='${sponsorId.mkString}'"
+      val (columns3, results3) = executeQuery(readOnlyConnection(), sqlQuery3)
+
+      retJson + ("totalAudiencesCount" -> Json.toJson(results2.next().apply(columns2.indexOf("totalAudiencesCount")))) + ("totalPopulationCount" -> Json.toJson(results3.next().apply(columns3.indexOf("totalPopulationCount"))))
+    } else {
+      null
+    }
+  }
+
+  def checkAllAudienceRules(sponsorId:String, forced:Boolean):Future[String]={
+    val ruless:List[String]=fetchAllAudienceRules(sponsorId)
+    val memCacheFuture=Future.traverse(ruless)(rules =>
+      Future{
+        try {
+          if(forced!=null && forced==true){
+            fetchAudienceStatisticsForced(rules)
+          }else {
+            checkAudienceRules(rules)
+          }
+        }catch{ case exc:Exception =>
+          exc.printStackTrace()
+          null
+        }
+      })
+    for{r1 <- memCacheFuture} yield sponsorId
+  }
+  def fetchAllAudienceRules(sponsorId:String):List[String]={
+    try {
+      val iSqlQueryAudience = s"select [Rule] from  ${audienceSchema}.audiences"
+      val (columns, results) = executeQuery(readOnlyConnection(), iSqlQueryAudience)
+      var listRules: List[String] = List()
+      while (results.hasNext) {
+        val result = results.next
+        val ruleStr = result.apply(0)
+        listRules = listRules :+ ruleStr
+      }
+      listRules
+    }catch{
+      case exc:Exception => exc.printStackTrace()
+                  throw exc
+    }
+  }
+
+  def fetchAudienceStatisticsForced( rules:String):JsObject={
+    val jsonRules = Json.parse(rules)
+    val sponsorId = ((jsonRules) \ ("sponsorId")).as[JsString].value
+    val audienceId = if (jsonRules.as[JsObject].keys.contains("audienceId")) ((jsonRules) \ ("audienceId")).as[JsString].value else ""
+    val newStatsMetaStr=computeNewStatsMeta(jsonRules)
+    val eligTable = getEligTable(sponsorId)
+    val eligMiscJoin = getEligMiscJoin(sponsorId)
+    val sponsorFieldMappings: mutable.HashMap[String, mutable.HashMap[String, String]] = readSponsorFieldMappings()
+    val sqlRule = RuleParser.parseRule(rules, sponsorFieldMappings.apply(sponsorId))
+    val sqlIndividualRules = RuleParser.parseIndividualRules(rules, sponsorFieldMappings.apply(sponsorId))
+
+    val sponsorSchema = getSponsorSchema(sponsorId)
+    val overlapSqlQuery = s"SELECT MA.AudienceId as audienceId, count(DISTINCT Ma.Guid) as overlaps\nFROM ${sponsorSchema}.${eligTable} E\n${eligMiscJoin}\nJOIN ${audienceSchema}.MemberAudiences MA ON E.Guid=MA.Guid\nWHERE E.CustomerId=MA.SponsorId\nAND E.RecordStatus IN ('C', 'Z')\nAND ((E.EligibilityStartDate >= MA.StartDate AND E.EligibilityStartDate <= MA.EndDate)\n    OR\n     (E.EligibilityEndDate >= MA.StartDate AND E.EligibilityEndDate <= MA.EndDate)\n    OR\n     (MA.StartDate >= E.EligibilityStartDate AND MA.StartDate <= E.EligibilityEndDate)\n    OR\n     (MA.EndDate >= E.EligibilityStartDate AND MA.EndDate <= E.EligibilityEndDate)) \nAND ${sqlRule}\nGROUP BY MA.AudienceId"
+    val (columns, results) = executeQuery(readOnlyConnection(), overlapSqlQuery)
+    val counts = Json.obj("overlaps" -> Json.toJson((for (r <- results) yield Json.obj("audienceId" -> r.apply(columns.indexOf("audienceId")), "overlaps" -> r.apply(columns.indexOf("overlaps")))).toList))
+
+    val countSqlQuery = s"SELECT count(DISTINCT E.Guid) as count\nFROM ${sponsorSchema}.${eligTable} E\n${eligMiscJoin}\nWHERE E.CustomerId='${sponsorId}'\nAND E.RecordStatus IN ('C', 'Z') AND ${sqlRule}"
+    val (columns2, results2) = executeQuery(readOnlyConnection(), countSqlQuery)
+
+    val totalCountSqlQuery = s"SELECT count(DISTINCT E.Guid) as totalPopulationCount\nFROM ${sponsorSchema}.${eligTable} E\n${eligMiscJoin}\nWHERE E.CustomerId='${sponsorId}'\nAND E.RecordStatus IN ('C', 'Z')"
+    val (columns3, results3) = executeQuery(readOnlyConnection(), totalCountSqlQuery)
+
+    val netOverlapSqlQuery = s"SELECT count(DISTINCT Ma.Guid) as netOverlapCount\nFROM ${sponsorSchema}.${eligTable} E\n${eligMiscJoin}\nJOIN ${audienceSchema}.MemberAudiences MA ON E.Guid=MA.Guid\nWHERE E.CustomerId=MA.SponsorId\nAND E.RecordStatus IN ('C', 'Z')\nAND ((E.EligibilityStartDate >= MA.StartDate AND E.EligibilityStartDate <= MA.EndDate)\n    OR\n     (E.EligibilityEndDate >= MA.StartDate AND E.EligibilityEndDate <= MA.EndDate)\n    OR\n     (MA.StartDate >= E.EligibilityStartDate AND MA.StartDate <= E.EligibilityEndDate)\n    OR\n     (MA.EndDate >= E.EligibilityStartDate AND MA.EndDate <= E.EligibilityEndDate))\nAND MA.audienceId != '${audienceId}'\nAND ${sqlRule}"
+    val (columns5, results5) = executeQuery(readOnlyConnection(), netOverlapSqlQuery)
+
+    val individualCountQueries = (for ((k, v) <- sqlIndividualRules) yield s"SELECT '${k}' as uuid, count(DISTINCT E.Guid) as count\nFROM ${sponsorSchema}.${eligTable} E\n${eligMiscJoin}\nWHERE E.CustomerId='${sponsorId}'\nAND E.RecordStatus IN ('C', 'Z') AND ${v}").mkString("\nUNION\n")
+    var breakdown = Json.toJson(List.empty[String])
+    if (!individualCountQueries.isEmpty()) {
+      val (columns4, results4) = executeQuery(readOnlyConnection(), individualCountQueries)
+      breakdown = Json.toJson((for (r <- results4) yield Json.obj("uuid" -> r.apply(columns4.indexOf("uuid")), "count" -> r.apply(columns4.indexOf("count")))).toList)
+    }
+    val count = results2.next().apply(columns2.indexOf("count"))
+    val retJson=counts + ("count" -> Json.toJson(count)) + ("totalPopulationCount" -> Json.toJson(results3.next().apply(columns3.indexOf("totalPopulationCount")))) + ("netOverlapCount" -> Json.toJson(results5.next().apply(columns5.indexOf("netOverlapCount")))) + ("breakdown" -> breakdown)
+    if(audienceId!="" && isAudiencePublishedAndIncomingStatsSame(audienceId, newStatsMetaStr)) {
+      memcachedAddStatistics(audienceId, newStatsMetaStr, retJson)
+    }
+    statsForAudienceId(retJson, audienceId)
+  }
+
+  def checkAudienceRules(rules: String): JsObject = {
+    val jsonRules = Json.parse(rules)
+    val sponsorId = ((jsonRules) \ ("sponsorId")).as[JsString].value
+    val audienceId = if (jsonRules.as[JsObject].keys.contains("audienceId")) ((jsonRules) \ ("audienceId")).as[JsString].value else ""
+    val newStatsMetaStr=computeNewStatsMeta(jsonRules)
+    val stats: AudienceStats = memcachedFetchStatistics(audienceId, sponsorId, newStatsMetaStr)
+    if (stats != null) {
+      logger.info(s"stats found in memcached for audience id ${audienceId}")
+      statsForAudienceId(stats.statsJson, audienceId)
+    } else {
+      fetchAudienceStatisticsForced(rules)
+    }
+  }
+
+  def statsForAudienceId(statsJson:JsObject, audienceId:String):JsObject={
+    def drop(overlaps:JsArray, audienceId: String): JsArray = {
+      //val arr:Seq[JsValue]=items.filter(((_)\"audienceId").as[JsString].value != id)
+      val items:Seq[JsValue]=overlaps.value
+      var i:Int=0
+      breakable {
+        while (i < items.length) {
+          val item=items(i)
+          if ((item \ ("audienceId")).as[JsString].value == audienceId) {
+            break
+          }
+          i=i+1
+        }
+      }
+      Json.toJson(items.zipWithIndex.filter(_._2 != i).map(_._1)).as[JsArray]
+
+    }
+    var overlapsNew:JsArray=drop((statsJson\("overlaps")).as[JsArray], audienceId)
+    statsJson - "overlaps" + ("overlaps" -> overlapsNew)
+
+  }
+  def isAudiencePublishedAndIncomingStatsSame(audienceId:String, newStatsMetaStr:String):Boolean={
+    val audienceQuery=s"select [Rule] from ${audienceSchema}.Audiences where audienceId='${audienceId}'"
+    val (columns, results) = executeQuery(readOnlyConnection(), audienceQuery)
+    results.hasNext &&
+      computeNewStatsMeta(Json.parse(results.next().apply(0)))==newStatsMetaStr
+  }
+
+  def computeNewStatsMeta(jsonRules:JsValue):String={
+    val sponsorId = ((jsonRules) \ ("sponsorId")).as[JsString].value
+    //val audienceId = if (jsonRules.as[JsObject].keys.contains("audienceId")) ((jsonRules) \ ("audienceId")).as[JsString].value else ""
+    val startDate = (jsonRules \ ("startDate")).as[JsString].value.substring(0, 10)
+    val endDate = if (jsonRules.as[JsObject].keys.contains("endDate")) ((jsonRules) \ ("endDate")).as[JsString].value.substring(0, 10) else "9999-12-31"
+    val rules:JsObject=(jsonRules \ ("rules")).as[JsObject]
+    val newStatsMeta=Json.obj("sponsorId" -> Json.toJson(sponsorId)) /*+ ("audienceId" -> Json.toJson(audienceId))*/ + ("startDate" -> Json.toJson(startDate)) + ("endDate" -> Json.toJson(endDate)) + ("rules" -> rules)
+    newStatsMeta.toString
+  }
+
+  def memcachedFetchStatistics(audienceId:String, sponsorId:String,newStatsMetaStr:String):AudienceStats={
+    logger.info(s"fetching statistics from memcached for audience id ${audienceId}")
+    try {
+      if (audienceId == "") {
+        null
+      } else {
+        val newStatsMetaHash = computeSha1Hash(newStatsMetaStr)
+        var statsData: AudienceStats = memcachedService.fetchStatsDataForMetaHash(newStatsMetaHash)
+        val statsMetaStr = memcachedService.fetchStatsMetaForAudience(audienceId)
+        if ((statsMetaStr!=null && statsMetaStr==newStatsMetaStr) || isAudiencePublishedAndIncomingStatsSame(audienceId,newStatsMetaStr)){
+          //val statsMetaStr = memcachedService.fetchStatsMetaForAudience(audienceId)
+          //println(s"stats meta str ${statsMetaStr}")
+          if (statsMetaStr !=null && statsMetaStr != newStatsMetaStr) {
+            val oldstatsMetaHash = computeSha1Hash(statsMetaStr)
+            memcachedService.deleteAudienceId(audienceId, oldstatsMetaHash)
+          }
+          if(statsData != null)
+          {
+
+            if (!(statsData.statsJson.keys.contains("overlaps"))
+              || !(statsData.statsJson.keys.contains("netOverlapCount"))) {
+              //println("updating overlaps and netoverlapcount in memcached")
+              if (sponsorFieldMappingsRead == null) {
+                sponsorFieldMappingsRead = readSponsorFieldMappings()
+              }
+              statsData.statsJson = updateMemcachedStatsData(audienceId, newStatsMetaStr,
+                sponsorId, sponsorFieldMappingsRead.apply(sponsorId))
+            }
+            //println(s"stats meta data could not be fetched from memcached for audience id ${audienceId}")
+            if (statsMetaStr != newStatsMetaStr) {
+              //memcachedService.deleteStatsForStatsMetaHash(computeSha1Hash(statsMetaStr))
+              memcachedService.addStatsMetaForAudience(audienceId, newStatsMetaStr)
+              /*val oldstatsMetaHash = computeSha1Hash(statsMetaStr)
+              memcachedService.deleteAudienceId(audienceId, oldstatsMetaHash)
+              */
+              if (statsData.audienceIds == null) {
+                statsData.audienceIds = List()
+              }
+              if (statsData.audienceIds.isEmpty
+                || !statsData.audienceIds.contains(audienceId)) {
+                statsData.audienceIds = statsData.audienceIds :+ audienceId
+                val status=memcachedService.addAudienceStatsForMetaHash(newStatsMetaHash, statsData)
+                if(status==true) {
+                  logger.info(s"Added audience id ${audienceId} in memcached for stats data as a " +
+                    s"published audience mapped to the stats")
+                }else{
+                  logger.info(s"Could not add audience id in memcached with stats meta data entry for id ${audienceId}")
+                }
+              }
+            }
+          }
+        }
+        statsData
+      }
+    }catch{
+      case exc:Exception =>
+        logger.error("Exception while fetching statistics from memcached server for audience id " + audienceId , exc )
+        null
+    }
+  }
+
+  def computeSha1Hash(statsMetaStr:String):String={
+    val md = MessageDigest.getInstance("SHA-1")
+    val mdVal=md.digest(statsMetaStr.getBytes)
+    new BigInteger(1, mdVal).toString(16);
+
+  }
+
+  def memcachedAddStatistics(audienceId:String, newStatsMetaStr:String, statsJson:JsObject)={
+    //val oldstatsMetaHash=computeSha1Hash(statsMetaStr)
+    //memcachedService.deleteAudienceId(audienceId,oldstatsMetaHash)
+    val statsHash=computeSha1Hash(newStatsMetaStr)
+    memcachedService.addAudienceStatsForMetaHash(statsHash, AudienceStats(null, statsJson, List(audienceId)))
+    val status=memcachedService.addStatsMetaForAudience(audienceId,newStatsMetaStr)
+    if(status==true) {
+      logger.info(s"Added audience id ${audienceId} in memcached for stats data as a " +
+        s"published audience mapped to the stats")
+    }else{
+      logger.info(s"Could not add audience id in memcached with stats meta data entry for id ${audienceId}")
+    }
+  }
+
+
+  def publishAudience(audience: String): Future[(String,String,mutable.HashMap[String, String],JsArray)] = {
+    val jsonAudience = Json.parse(audience)
+    val sponsorId = ((jsonAudience)\("sponsorId")).as[JsString].value
+    val eligTable = getEligTable(sponsorId)
+    val eligMiscJoin = getEligMiscJoin(sponsorId)
+    val audienceId = ((jsonAudience)\("audienceId")).as[JsString].value
+    val startDate = ((jsonAudience)\("startDate")).as[JsString].value.substring(0,10)
+    val endDate = if (jsonAudience.as[JsObject].keys.contains("endDate")) ((jsonAudience)\("endDate")).as[JsString].value.substring(0,10) else "9999-12-31"
+    val sponsorSchema = getSponsorSchema(sponsorId)
+    val sponsorFieldMappings: mutable.HashMap[String, mutable.HashMap[String, String]] = readSponsorFieldMappings()
+
+    val connection = DriverManager.getConnection(mssqlConfig.Url)
+    connection.setAutoCommit(false)
+
+    try {
+      val sqlRule = RuleParser.parseRule(audience, sponsorFieldMappings.apply(sponsorId))
+      //println("sqlrule "+sqlRule)
+      val dSqlQuery = s"DELETE FROM ${audienceSchema}.Audiences WHERE AudienceId='${audienceId}'"
+      connection.createStatement.execute(dSqlQuery)
+      val cSqlQuery = s"INSERT INTO ${audienceSchema}.Audiences (SponsorId, AudienceId, [Rule], RuleSql, StartDate, EndDate) VALUES ('${sponsorId}', '${audienceId}', ?, ?, '${startDate}', '${endDate}')"
+      val iSqlQueryMA = s"INSERT INTO ${audienceSchema}.MemberAudiences (EligId, Guid, SponsorId, StartDate, EndDate, AudienceId) \nSELECT DISTINCT E.Id, Guid, '${sponsorId}', '${startDate}', '${endDate}', '${audienceId}'\nFROM ${sponsorSchema}.${eligTable} E\n${eligMiscJoin}\nWHERE E.RecordStatus IN ('C', 'Z') AND ${sqlRule}"
+      //println("insert ma query "+iSqlQueryMA)
+      val cSqlQueryStmt = connection.prepareStatement(cSqlQuery)
+      cSqlQueryStmt.setString(1, audience)
+      cSqlQueryStmt.setString(2, iSqlQueryMA)
+      cSqlQueryStmt.executeUpdate()
+      val dSqlQueryMA = s"DELETE FROM ${audienceSchema}.MemberAudiences WHERE AudienceId='${audienceId}'"
+      connection.createStatement.execute(dSqlQueryMA)
+      connection.createStatement.execute(iSqlQueryMA)
+      val dSqlQueryAO = s"DELETE FROM ${audienceSchema}.AudienceOfferings WHERE AudienceId='${audienceId}'"
+      connection.createStatement.execute(dSqlQueryAO)
+      val offerings = (((Json.parse(audience)) \ ("products")) \ ("resolved")).as[JsArray]
+      val values = (for {offering <- offerings.value
+                         productId = (offering \ ("productId")).as[JsString].value
+                         productType = (offering \ ("productType")).as[JsString].value
+                         productCode = if (offering.as[JsObject].keys.contains("productCode")) (offering \ ("productCode")).as[JsString].value else ""
+                         } yield s"('${audienceId}','${sponsorId}','${productType}','${startDate}','${endDate}','${productCode}','${productId}')").mkString(",")
+
+      if (values.length() > 0) {
+        val iSqlQueryAO = s"INSERT INTO ${audienceSchema}.AudienceOfferings (AudienceId, SponsorId, OfferingType, StartDate, EndDate, Code, OfferingId) VALUES ${values}"
+        connection.createStatement.execute(iSqlQueryAO)
+      }
+      connection.commit()
+
+      akkaService.publishMemberOfferings(audienceId,sponsorId, startDate, endDate);
+      logger.info(s"sent memberofferings akka message for audience id ${audienceId}")
+      //      val dSqlQueryMO = s"DELETE FROM ${audienceSchema}.MemberOfferings WHERE SponsorId='${sponsorId}'"
+      //      connection.createStatement.execute(dSqlQueryMO)
+      //
+      //      val iSqlQueryMO = s"INSERT INTO ${audienceSchema}.MemberOfferings (Guid, SponsorId, OfferingType, StartDate, EndDate, Code, OfferingId)\nSELECT DISTINCT MA.Guid, MA.SponsorId, AO.OfferingType, AO.StartDate, AO.EndDate, AO.Code, AO.OfferingId\nFROM ${audienceSchema}.MemberAudiences MA\nJOIN ${audienceSchema}.AudienceOfferings AO ON MA.AudienceId=AO.AudienceId\nWHERE AO.OfferingType NOT IN ('rewards', 'challenges') \n  AND AO.SponsorId='${sponsorId}' \nUNION\nSELECT DISTINCT MA.Guid, MA.SponsorId, AO.OfferingType, AO.StartDate, AO.EndDate, NULL, AO.AudienceId\nFROM ${audienceSchema}.MemberAudiences MA\n         JOIN ${audienceSchema}.AudienceOfferings AO ON MA.AudienceId=AO.AudienceId\nWHERE AO.OfferingType IN ('rewards', 'challenges')\n  AND AO.SponsorId='${sponsorId}'"
+      //      connection.createStatement.execute(iSqlQueryMO)
+      //publishStatsInMemcached(jsonAudience)
+      deleteOverlapsDataInMemcached(jsonAudience)
+    }
+    finally {
+      connection.close()
+    }
+  }
+
+  def deleteOverlapsDataInMemcached(jsonAudience:JsValue):Future[(String,String,mutable.HashMap[String, String],JsArray)]={
+    try {
+      val sponsorFieldMappings: mutable.HashMap[String, mutable.HashMap[String, String]] = readSponsorFieldMappings()
+      val sponsorId = ((jsonAudience) \ ("sponsorId")).as[JsString].value
+      val audienceId = ((jsonAudience) \ ("audienceId")).as[JsString].value
+      val fieldMappings: mutable.HashMap[String, String] = sponsorFieldMappings.apply(sponsorId)
+      var overlapsArray:JsArray=null
+      if(jsonAudience.as[JsObject].keys.contains("statistics")) {
+        val audienceStatistics = ((jsonAudience) \ ("statistics")).as[JsObject]
+        overlapsArray = ((audienceStatistics) \ ("overlaps")).as[JsArray]
+      }else{
+        val (netOverlapCount,overlaps)=computeOverlaps(audienceId,sponsorId,computeNewStatsMeta(jsonAudience),fieldMappings)
+        overlapsArray=overlaps.as[JsArray]
+      }
+      val memCacheFuture = Future.traverse(overlapsArray.value)(overlap =>
+        memcachedService.deleteAudienceOverlaps(getAudienceOverlap(overlap).audienceId))
+      for {r1 <- memCacheFuture} yield (audienceId, sponsorId, fieldMappings, overlapsArray)
+    }catch{ case exc:Exception => logger.error(s"Exception while deleting overlaps data from " +
+      s"memcached on publish for audience id ${((jsonAudience) \ ("audienceId")).as[JsString].value}", exc)
+      throw exc
+    }
+  }
+
+  def updateMemcachedStatsData(audienceId:String, statsMetaStr:String, sponsorId:String, fieldMappings:mutable.HashMap[String, String]):JsObject= {
+
+    val audienceStats:AudienceStats=memcachedService.fetchStatsDataForMetaHash(computeSha1Hash(statsMetaStr))
+    val statsjson=audienceStats.statsJson.as[JsObject]
+    if(!statsjson.keys.contains("overlaps") || !statsjson.keys.contains("netOverlapCount")) {
+      val (netOverlap,counts)=computeOverlaps(audienceId,sponsorId,statsMetaStr,fieldMappings)
+      memcachedService.addAudienceOverlap(audienceId, counts, netOverlap.toLong, statsMetaStr)
+    }else{
+      statsjson
+    }
+
+  }
+
+  def computeOverlaps(audienceId:String, sponsorId:String, statsMetaStr:String,
+                      fieldMappings:mutable.HashMap[String, String]):(String, JsValue)={
+    val sqlRule = RuleParser.parseRule(statsMetaStr, fieldMappings)
+    val eligTable = getEligTable(sponsorId)
+    val eligMiscJoin = getEligMiscJoin(sponsorId)
+    val sponsorSchema = getSponsorSchema(sponsorId)
+    val netOverlapSqlQuery =  s"SELECT count(DISTINCT Ma.Guid) as netOverlapCount\nFROM ${sponsorSchema}.${eligTable} E\n${eligMiscJoin}\nJOIN ${audienceSchema}.MemberAudiences MA ON E.Guid=MA.Guid\nWHERE E.CustomerId=MA.SponsorId\nAND E.RecordStatus IN ('C', 'Z')\nAND ((E.EligibilityStartDate >= MA.StartDate AND E.EligibilityStartDate <= MA.EndDate)\n    OR\n     (E.EligibilityEndDate >= MA.StartDate AND E.EligibilityEndDate <= MA.EndDate)\n    OR\n     (MA.StartDate >= E.EligibilityStartDate AND MA.StartDate <= E.EligibilityEndDate)\n    OR\n     (MA.EndDate >= E.EligibilityStartDate AND MA.EndDate <= E.EligibilityEndDate))\nAND MA.audienceId != '${audienceId}'\nAND ${sqlRule}"
+    val (columns, results) = executeQuery(readOnlyConnection(), netOverlapSqlQuery)
+    val netOverlap = results.next().apply(columns.indexOf("netOverlapCount"))
+    val overlapSqlQuery = s"SELECT MA.AudienceId as audienceId, count(DISTINCT Ma.Guid) as overlaps\nFROM ${sponsorSchema}.${eligTable} E\n${eligMiscJoin}\nJOIN ${audienceSchema}.MemberAudiences MA ON E.Guid=MA.Guid\nWHERE E.CustomerId=MA.SponsorId\nAND E.RecordStatus IN ('C', 'Z')\nAND ((E.EligibilityStartDate >= MA.StartDate AND E.EligibilityStartDate <= MA.EndDate)\n    OR\n     (E.EligibilityEndDate >= MA.StartDate AND E.EligibilityEndDate <= MA.EndDate)\n    OR\n     (MA.StartDate >= E.EligibilityStartDate AND MA.StartDate <= E.EligibilityEndDate)\n    OR\n     (MA.EndDate >= E.EligibilityStartDate AND MA.EndDate <= E.EligibilityEndDate)) \nAND ${sqlRule}\nGROUP BY MA.AudienceId"
+    val (columns1, results1) = executeQuery(readOnlyConnection(), overlapSqlQuery)
+    val counts = Json.toJson((for (r <- results1) yield Json.obj("audienceId" -> r.apply(columns1.indexOf("audienceId")), "overlaps" -> r.apply(columns1.indexOf("overlaps")))).toList)
+    (netOverlap,counts)
+  }
+
+  def getAudienceOverlap(overlap:JsValue):AudienceOverlap={
+    AudienceOverlap((overlap\("audienceId")).as[JsString].value,(overlap\("overlaps")).as[JsString].value.toLong)
+  }
+
+  def unpublishAudience(audienceId: String): Future[(String,String,mutable.HashMap[String, String],JsArray)] = {
+    val (sponsorId,startDate,endDate,jsonAudience)=getAudienceData(audienceId)
+    //    val dSqlQueryMO = s"DELETE FROM ${audienceSchema}.MemberOfferings WHERE SponsorId IN (SELECT SponsorId FROM ${audienceSchema}.Audiences WHERE AudienceId='${audienceId}')"
+    //    val iSqlQueryMO = s"INSERT INTO ${audienceSchema}.MemberOfferings (Guid, SponsorId, OfferingType, StartDate, EndDate, Code, OfferingId)\nSELECT DISTINCT MA.Guid, MA.SponsorId, AO.OfferingType, AO.StartDate, AO.EndDate, AO.Code, AO.OfferingId\nFROM ${audienceSchema}.MemberAudiences MA\nJOIN ${audienceSchema}.AudienceOfferings AO ON MA.AudienceId=AO.AudienceId\nJOIN ${audienceSchema}.Audiences A ON A.SponsorId=AO.SponsorId\nWHERE AO.OfferingType NOT IN ('rewards', 'challenges')\n  AND A.AudienceId='${audienceId}'\n  AND AO.AudienceId!='${audienceId}'\nUNION\nSELECT DISTINCT MA.Guid, MA.SponsorId, AO.OfferingType, AO.StartDate, AO.EndDate, NULL, AO.AudienceId\nFROM ${audienceSchema}.MemberAudiences MA\nJOIN ${audienceSchema}.AudienceOfferings AO ON MA.AudienceId=AO.AudienceId\nJOIN ${audienceSchema}.Audiences A ON A.SponsorId=AO.SponsorId\nWHERE AO.OfferingType IN ('rewards', 'challenges')\n  AND A.AudienceId='${audienceId}'\n  AND AO.AudienceId!='${audienceId}'"
+    val dSqlQueryAO = s"DELETE FROM ${audienceSchema}.AudienceOfferings WHERE AudienceId='${audienceId}'"
+    val dSqlQueryMA = s"DELETE FROM ${audienceSchema}.MemberAudiences WHERE AudienceId='${audienceId}'"
+    val dSqlQueryA = s"DELETE FROM ${audienceSchema}.Audiences WHERE AudienceId='${audienceId}'"
+
+    val connection = DriverManager.getConnection(mssqlConfig.Url)
+    connection.setAutoCommit(false)
+    try {
+      //      connection.createStatement.execute(dSqlQueryMO)
+      //      connection.createStatement.execute(iSqlQueryMO)
+      connection.createStatement.execute(dSqlQueryAO)
+      connection.createStatement.execute(dSqlQueryMA)
+      connection.createStatement.execute(dSqlQueryA)
+      connection.commit()
+    }
+    finally {
+      connection.close()
+    }
+
+    akkaService.unpublishMemberOfferings(audienceId,sponsorId,startDate,endDate)
+    deleteAudienceRulesInMemcached(audienceId)
+    deleteOverlapsDataInMemcached(Json.parse(jsonAudience))
+
+  }
+
+  def deleteAudienceRulesInMemcached(audienceId:String)={
+    logger.info(s"Deleting stats entries in memcached for audience ${audienceId}")
+    try {
+      val statsMeta: String = memcachedService.fetchStatsMetaForAudience(audienceId)
+      if(statsMeta!=null) {
+        memcachedService.deleteAudienceId(audienceId, computeSha1Hash(statsMeta))
+        memcachedService.deleteStatsMetaForAudience(audienceId)
+      }
+    }catch{ case exc:Exception => logger.error("Exception while deleting stats entries in memcached for " +
+      s"audience id ${audienceId}", exc)
+      throw exc}
+  }
+
+  def checkSingleRule(rule:String):JsObject={
+    //println("inside checkSingleRule")
+    val jsonRule = Json.parse(rule)
+    val sponsorId = ((jsonRule)\("sponsorId")).as[JsString].value
+    val eligTable = getEligTable(sponsorId)
+    val eligMiscJoin = getEligMiscJoin(sponsorId)
+    val sponsorFieldMappings: mutable.HashMap[String, mutable.HashMap[String, String]] = readSponsorFieldMappings()
+    val sqlIndividualRule = RuleParser.parseIndividualRule(rule, sponsorFieldMappings.apply(sponsorId))
+    val sponsorSchema = getSponsorSchema(sponsorId)
+    var uszipsJoin=""
+    if(sqlIndividualRule._3==true) {
+      uszipsJoin="JOIN Paddu.uszips U ON E.PZipCode=U.zip"
+    }
+    val individualCountQuery = s"SELECT '${sqlIndividualRule._1}' as uuid, count(DISTINCT E.Guid) as count\nFROM ${sponsorSchema}.${eligTable} E\n${eligMiscJoin}\n${uszipsJoin}\nWHERE E.CustomerId='${sponsorId}'\nAND E.RecordStatus IN ('C', 'Z') AND ${sqlIndividualRule._2}"
+    //println(s"individual count query ${individualCountQuery}")
+    val (columns4, results4) = executeQuery(readOnlyConnection(), individualCountQuery)
+    val result=results4.next()
+    Json.obj("uuid" -> result.apply(columns4.indexOf("uuid")), "count" -> result.apply(columns4.indexOf("count")))
+  }
+
+  def fixAudiences(): String = {
+    val conn = DriverManager.getConnection(mssqlConfig.Url)
+    //connection.setAutoCommit(false)
+    try {
+      val fetchAllMOUnpublishedAudiences = s"select id, audienceId, sponsorid, startdate, enddate " +
+        s"from ${audienceSchema}.audiences where memberofferingstatus!=2 order by id asc"
+      val (columnsMO, resultsMO) = executeQuery(conn, fetchAllMOUnpublishedAudiences)
+      var i=0
+      while (resultsMO.hasNext) {
+        var resultMO = resultsMO.next
+        akkaService.publishMemberOfferings(resultMO.apply(1), resultMO.apply(2), resultMO.apply(3), resultMO.apply(4),i)
+        i+=1
+      }
+      logger.info(s"Publishing MOs for ${i} audiences")
+    }catch{ case exc:Exception =>
+      exc.printStackTrace()
+      throw exc
+    }finally{
+      conn.close()
+    }
+
+    //    val sponsorFieldMappings: mutable.HashMap[String, mutable.HashMap[String, String]] = readSponsorFieldMappings()
+    //
+    //    val connection = DriverManager.getConnection(mssqlConfig.Url)
+    //    connection.setAutoCommit(false)
+    //
+    //    try {
+    //      val audiencesToFix = "SELECT * FROM ${audienceSchema}.Audiences WHERE RuleSql is NULL"
+    //      val (columns, results) = executeQuery(connection, audiencesToFix)
+    //
+    //      while (results.hasNext) {
+    //        val entry = results.next()
+    //        val sponsorId = entry.apply(columns.indexOf("SponsorId"))
+    //        val audienceId = entry.apply(columns.indexOf("AudienceId"))
+    //        val rules = entry.apply(columns.indexOf("Rule"))
+    //        val startDate = ((Json.parse(rules)) \ ("startDate")).as[JsString].value.substring(0, 10)
+    //        val endDate = ((Json.parse(rules)) \ ("endDate")).as[JsString].value.substring(0, 10)
+    //        val sponsorSchema = getSponsorSchema(sponsorId)
+    //
+    //        val sqlRule = RuleParser.parseRule(rules, sponsorFieldMappings.apply(sponsorId))
+    //        val audienceSql = s"INSERT INTO ${audienceSchema}.MemberAudiences (EligId, Guid, SponsorId, StartDate, EndDate, AudienceId) \nSELECT DISTINCT E.Id, Guid, '${sponsorId}', '${startDate}', '${endDate}', '${audienceId}'\nFROM ${sponsorSchema}.${eligTable} E\n${eligMiscJoin}\nWHERE E.RecordStatus IN ('C', 'Z') AND ${sqlRule}"
+    //
+    //        val sqlUpdate = s"UPDATE ${audienceSchema}.Audiences SET RuleSql=?, StartDate='${startDate}', EndDate='${endDate}' WHERE AudienceId='${audienceId}'"
+    //        val stmt = connection.prepareStatement(sqlUpdate)
+    //        stmt.setString(1, audienceSql)
+    //        stmt.executeUpdate()
+    //      }
+    //      connection.commit()
+    //    }
+    //    finally {
+    //      connection.close()
+    //    }
+
+    ""
+
+  }
+
+  // def saveFilterConfig()
+
+  private def getSponsorSchema(sponsorId: String): String = {
+    if (isAudienceMembershipSupported(sponsorId)) {
+      // If communitySponsor
+      if (mssqlConfig.prop.getProperty("dhs.communitySponsorSchema") != null) mssqlConfig.prop.getProperty("dhs.communitySponsorSchema")
+      else getAudienceSchema()
+    }
+    else {
+      if (mssqlConfig.prop.getProperty("dhs.sponsorSchema") != null) mssqlConfig.prop.getProperty("dhs.sponsorSchema")
+      else (sponsorId.split("_").tail.mkString)
+    }
+  }
+
+  private def sponsorSchemaExists(sponsorId: String): Boolean = {
+    val sponsorSchema = sponsorId.split("_").tail.mkString
+    val sqlQuery = s"SELECT TOP 1 CustomerId FROM ${sponsorSchema}.Elig"
+    var clientId: String = ""
+
+    try {
+      val (columns, results) = executeQuery(readOnlyConnection(), sqlQuery)
+
+      while (results.hasNext) {
+        val entry = results.next()
+        clientId = entry.apply(columns.indexOf("CustomerId"))
+      }
+    } catch {
+      case e: SQLException => {clientId = ""}
+    }
+
+    (clientId.toUpperCase() == sponsorId.toUpperCase()) && (clientId != "")
+  }
+
+  private def getAudienceSchema(): String = {
+    if (mssqlConfig.prop.getProperty("dhs.audienceSchema") != null) mssqlConfig.prop.getProperty("dhs.audienceSchema") else "_AudienceSvc"
+  }
+
+  private def isConsumerSponsor(sponsorId: String): Boolean = {
+    // If sponsorId is SC_CONSUMER it is a consumer sponsor
+    (sponsorId.mkString == "SC_CONSUMER")
+  }
+
+  private def isCommunitySponsor(sponsorId: String): Boolean = {
+    (sponsorId.split("_").head.mkString == "CM")
+  }
+
+  private def isAudienceMembershipSupported(sponsorId: String): Boolean = {
+    (isConsumerSponsor(sponsorId) || isCommunitySponsor(sponsorId) || !sponsorSchemaExists(sponsorId))
+  }
+
+  private def getEligTable(sponsorId: String): String = {
+    if (isAudienceMembershipSupported(sponsorId)) "CommunityElig" else "Elig"
+  }
+
+  private def getEligMiscJoin(sponsorId: String): String = {
+    val sponsorSchema = getSponsorSchema(sponsorId)
+    if (isAudienceMembershipSupported(sponsorId)) "" else s"JOIN ${sponsorSchema}.EligMisc EM ON E.Id=EM.EligId"
+  }
+
+  private def refreshReadOnlyConnection(connection: Connection) {
+    roConnection = connection
+  }
+
+  private def readOnlyConnection(): Connection = {
+    try{
+
+      if (roConnection == null || roConnection.isClosed()) {
+        refreshReadOnlyConnection(DriverManager.getConnection(mssqlConfig.Url))
+      }
+
+    }
+    catch {
+      case e: SQLException => refreshReadOnlyConnection(DriverManager.getConnection(mssqlConfig.Url))
+    }
+
+    roConnection
+
+  }
+
+
+}
+
+
+
+

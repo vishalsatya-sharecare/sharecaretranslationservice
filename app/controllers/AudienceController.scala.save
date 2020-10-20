@@ -1,0 +1,171 @@
+package controllers
+
+import com.sharecare.sdk.sso.play.Auth
+import services.AkkaService
+import data.mssql.MsSqlService
+import javax.inject._
+import play.api.Configuration
+import play.api.libs.ws.WSClient
+import play.api.mvc._
+import utils.implicits.ResultImplicits._
+import utils.scaffolds.Logging
+import scala.concurrent.ExecutionContext
+import play.api.libs.json.{JsArray}
+import scala.collection.mutable
+
+/**
+  * This is a simple example controller for the scala play cloud template. @Inject provides dependency
+  * injection for a handful of features:
+  *
+  * @param config configuration handling dependency injection (takes from /conf/)
+  * @param ws     outgoing web request client
+  * @param auth   authentication helper
+  * @param exec   execution context for multi-threading and async processes.
+  */
+@Singleton
+case class AudienceController @Inject()(
+  config: Configuration
+  , ws: WSClient
+  , auth: Auth
+  , mssql: MsSqlService, akkaService:AkkaService)(implicit exec: ExecutionContext) extends ControllerFrame with Logging {
+
+  val notProperAudienceRule = new Exception("Audience Rule not properly formatted")
+
+  val audienceIdNotFoundRule = new Exception("Audience Id not found in Request")
+  val notProperRuleJson= new Exception("Audience Rule Json Id not properly formatted")
+
+  def get(id: String): Action[AnyContent] = sponsorAware() {
+    val audience = mssql.retrieveAudience(id)
+    if (audience!=null) {
+      Ok(audience)
+    } else {
+      NoContent
+    }.disableCacheHeaders
+  }
+
+  def query: Action[AnyContent] = sponsorAware() { req =>
+    val sponsorId = if (req.getQueryString("sponsor-id").isEmpty) req.getQueryString("sponsorId") else req.getQueryString("sponsor-id")
+    val audiences = mssql.retrieveAudiences(sponsorId = sponsorId)
+    if (audiences != null) {
+      Ok(audiences)
+    } else {
+      NoContent
+    }.disableCacheHeaders
+  }
+
+  def populateAudienceStatisticsInMemcached(sponsorId: String):Action[AnyContent] = sponsorAware().async { req =>
+    val forced:Boolean=if (!req.getQueryString("forced").isEmpty){
+      try {
+        //println(req.getQueryString("forced").get)
+        req.getQueryString("forced").get.toBoolean
+      }catch{ case exc:Exception => //exc.printStackTrace();
+        false}
+    } else false
+    val fut=mssql.checkAllAudienceRules(sponsorId, forced)
+    fut.map { sponsorId =>
+      //println(s"sponsor id here ${sponsorId}")
+      Ok(sponsorId)
+    }
+  }
+
+  def checkAudienceRules:Action[AnyContent] = sponsorAware() { req =>
+    val rule = (req.body.asJson.getOrElse(throw notProperAudienceRule)).toString()
+    Ok(mssql.checkAudienceRules(rule)).disableCacheHeaders
+  }
+
+  def checkAudienceMembership:Action[AnyContent] = sponsorAware() { req =>
+    val rule = (req.body.asJson.getOrElse(throw notProperAudienceRule)).toString()
+    val audienceMembership = mssql.audienceMembership(rule)
+    if ((audienceMembership.value).apply("statusCode").toString() == "200") {
+      Ok(audienceMembership.value.apply("response")).disableCacheHeaders
+    } else {
+      BadRequest(audienceMembership.value.apply("message")).disableCacheHeaders
+    }
+  }
+
+  def deleteAudienceMembership(guid: String) = Action { req =>
+    val audienceMembership = mssql.deleteAudienceEligGuid(guid)
+    if ((audienceMembership.value).apply("statusCode").toString() == "200") {
+      NoContent
+    } else {
+      BadRequest(audienceMembership.value.apply("message")).disableCacheHeaders
+    }
+  }
+
+  def getAudienceMembership(guid: String) = Action { req =>
+    val sponsorId = req.getQueryString("sponsorId")
+    val audienceMembership = mssql.getAudienceMembership(guid, sponsorId)
+
+    if ((audienceMembership.value).apply("statusCode").toString() == "200") {
+      Ok((audienceMembership.value).apply("response")).disableCacheHeaders
+    } else {
+      NotFound(audienceMembership.value.apply("message")).disableCacheHeaders
+    }
+  }
+
+  def swapAudienceMembership:Action[AnyContent] = Action { req =>
+    val rule = (req.body.asJson.getOrElse(throw notProperAudienceRule)).toString()
+    val audienceMembership = mssql.swapAudienceEligGuid(rule)
+    if ((audienceMembership.value).apply("statusCode").toString() == "200") {
+      NoContent
+    } else {
+      BadRequest(audienceMembership.value.apply("message")).disableCacheHeaders
+    }
+  }
+
+  def publishAudience:Action[AnyContent] = sponsorAware().async { req =>
+    val audience = (req.body.asJson.getOrElse(throw notProperAudienceRule)).toString()
+    val fut=mssql.publishAudience(audience)
+    fut.map{
+     case (audienceId:String,sponsorId:String,
+       fieldMappings:mutable.HashMap[String,String],overlapsArray:JsArray) => //println(s"audience id here ${audienceId}")
+       akkaService.updateMemcachedStatsData(audienceId,sponsorId,fieldMappings,overlapsArray)
+            NoContent
+    }
+  }
+
+ def updateMemberOfferings(audienceId:String):Action[AnyContent] = sponsorAware() {
+    val (sponsorId,startDate,endDate,jsonAudience) = mssql.getAudienceData(audienceId)
+    val prevStatus: Int = akkaService.publishMemberOfferings(audienceId, sponsorId,startDate,endDate)
+    //println(s"prev status ${prevStatus}")
+
+    prevStatus match {
+      case 0 => Ok("Job submitted")
+      case 3 => Ok("Job submitted")
+      case 1 => Ok("Job already running")
+      case 2 => Ok("Job already processed")
+      case -1 => Ok("Audience Id not found")
+      case _  => Ok(s"Unknowm MemberOfferingStatus ${prevStatus} in Audience")
+    }
+  }
+
+
+
+  def resetMemberOfferingStatus(audienceId:String):Action[AnyContent] = sponsorAware() {
+    akkaService.resetMemberOfferingsforAudience(audienceId)
+    Ok("Audience Member Offering status reset success")
+
+  }
+
+  def unpublishAudience(id: String): Action[AnyContent] = sponsorAware().async {
+    val fut=mssql.unpublishAudience(id)
+    fut.map{
+      case (audienceId:String,sponsorId:String,
+      fieldMappings:mutable.HashMap[String,String],overlapsArray:JsArray) => //println(s"unpublished audience id here ${audienceId}")
+        akkaService.updateMemcachedStatsData(audienceId,sponsorId,fieldMappings,overlapsArray)
+        NoContent
+    }
+  }
+
+  def fixAudiences(): Action[AnyContent] = Action {
+    // Remove this
+    Ok(mssql.fixAudiences()).disableCacheHeaders
+  }
+
+  def checkSingleRule:Action[AnyContent] = sponsorAware() { req =>
+    val rule = (req.body.asJson.getOrElse(throw notProperRuleJson)).toString()
+    Ok(mssql.checkSingleRule(rule)).disableCacheHeaders
+  }
+
+  override val ControllerAddress: String = "audience"
+}

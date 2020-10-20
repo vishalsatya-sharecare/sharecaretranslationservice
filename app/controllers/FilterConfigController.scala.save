@@ -1,0 +1,71 @@
+package controllers
+
+import com.sharecare.sdk.sso.play.Auth
+import services.FilterConfigService
+import data.mssql.MsSqlService
+import javax.inject._
+import play.api.Configuration
+import play.api.libs.ws.WSClient
+import play.api.mvc._
+import utils.implicits.ResultImplicits._
+import utils.scaffolds.Logging
+import scala.concurrent.ExecutionContext
+import play.api.libs.json.JsValue
+
+@Singleton
+case class FilterConfigController @Inject()(
+                                             config: Configuration
+                                             , ws: WSClient
+                                             , auth: Auth
+                                             , filterConfigService: FilterConfigService)(implicit exec: ExecutionContext) extends ControllerFrame with Logging {
+
+  val notProperFilterConfig = new Exception("Filter Config Json is invalid")
+
+  def createFilters:Action[AnyContent] = sponsorAware() { req =>
+    val filter = (req.body.asJson.getOrElse(throw notProperFilterConfig)).toString()
+    filterConfigService.saveFilterConfig(filter)
+    NoContent
+  }
+
+  def filterConfigBySponsor(sponsorId:String): Action[AnyContent] = sponsorAware() { req =>
+    val filterConfig = filterConfigService.getFilterConfigBySponsor(null, sponsorId)
+    if (filterConfig != null) {
+      Ok(filterConfig)
+    } else {
+      NoContent
+    }.disableCacheHeaders
+  }
+
+  def filterConfigBySponsorAndKey(sponsorId:String, filterKey:String): Action[AnyContent] = sponsorAware() { req =>
+    val filterConfig = filterConfigService.getFilterConfigBySponsorAndKey(sponsorId, filterKey)
+    if (filterConfig != null) {
+      Ok(filterConfig)
+    } else {
+      NoContent
+    }.disableCacheHeaders
+  }
+
+  def saveSingleFilterConfig(sponsorId:String, filterKey:String):Action[AnyContent] = sponsorAware() { req =>
+    val filterConfig = (req.body.asJson.getOrElse(throw notProperFilterConfig)).toString()
+    var res:JsValue=filterConfigService.updateFilterConfig(sponsorId,filterKey, filterConfig)
+    if(res!=null) {
+      Ok(res)
+    }else{
+      MethodNotAllowed
+    }
+
+  }
+
+  def updateHierarchicalFilters(sponsorId:String):Action[AnyContent] = sponsorAware() { req =>
+    val filterConfig = (req.body.asJson.getOrElse(throw notProperFilterConfig)).toString()
+    val filterConfigs=filterConfigService.updateHierarchicalFilterOrder(sponsorId,filterConfig)
+    if(filterConfigs!=null) {
+      Ok(filterConfigs)
+    }else{
+      MethodNotAllowed
+    }
+  }
+
+  override val ControllerAddress: String = "filterConfig"
+
+}

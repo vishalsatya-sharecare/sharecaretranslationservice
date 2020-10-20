@@ -1,0 +1,74 @@
+package data.mssql
+
+import java.io.FileInputStream
+import java.util.Properties
+
+import play.api.Configuration
+
+object MsSql {
+
+  case class ApplicationConfiguration(config: Configuration) extends Configured
+
+  trait Configured {
+
+    import Errors._
+    import Paths._
+
+    val config: Configuration
+    val input = new FileInputStream(config.getString("lockerbox.properties").getOrElse(throw new IllegalArgumentException(DatabaseErrorMessage)))
+
+    val prop = new Properties()
+
+    prop.load(input)
+
+    def Host: String =
+      config.getString(server).getOrElse(throw new IllegalArgumentException(HostErrorMessage))
+
+    def Database: String =
+      config.getString(database).getOrElse(throw new IllegalArgumentException(DatabaseErrorMessage))
+
+    def Url: String = "jdbc:jtds:sqlserver://" +
+//      config.getString(server).getOrElse(throw new IllegalArgumentException(DatabaseErrorMessage)) + ":" +
+      prop.getProperty(server) + ":" +
+      config.getString(port).getOrElse(throw new IllegalArgumentException(DatabaseErrorMessage)) + "/" +
+      config.getString(database).getOrElse(throw new IllegalArgumentException(DatabaseErrorMessage)) + ";" +
+//      "user=" + config.getString(user).getOrElse(throw new IllegalArgumentException(DatabaseErrorMessage)) + ";" +
+//      "password=" + config.getString(password).getOrElse(throw new IllegalArgumentException(DatabaseErrorMessage)) + ";" +
+      "user=" + prop.getProperty(user) + ";" +
+      "password=" + prop.getProperty(password) + ";" +
+      "TDS=" + config.getString(tdsVersion).getOrElse(throw new IllegalArgumentException(DatabaseErrorMessage)) + ";" +
+      "domain=" + config.getString(trustedDomain).getOrElse(throw new IllegalArgumentException(DatabaseErrorMessage)) + ";" +
+      "useNTLMv2=" + config.getString(useNTLMv2).getOrElse(throw new IllegalArgumentException(DatabaseErrorMessage))
+
+//    def Url: String = config.getString(url).getOrElse(throw new IllegalArgumentException(DatabaseErrorMessage))
+
+  }
+
+  object Paths {
+    val server   = "db.mssql.server"
+    val database = "db.mssql.database"
+    val user     = "db.mssql.user"
+    val password = "db.mssql.password"
+
+    private[MsSql] val port            = "db.mssql.port"
+    private[MsSql] val driver          = "db.mssql.driver"
+    private[MsSql] val useNTLMv2       = "db.mssql.useNTLMv2"
+    private[MsSql] val tdsVersion      = "db.mssql.tdsVersion"
+    private[MsSql] val trustedDomain   = "db.mssql.trustedDomain"
+    private[MsSql] val sep   = ":"
+
+    val url = s"jdbc:jtds:sqlserver://${server}:${port}/${database};USER=${user};PASSWORD=${password};TDS=${tdsVersion};DOMAIN=${trustedDomain};USENTLMV2=${useNTLMv2}"
+  }
+
+  object Errors {
+
+    import Paths._
+
+    private[MsSql] val HostErrorMessage =
+      s"MsSqlConfiguration Error. No host provided - one is required. Configure with: $server (single instance)"
+
+    private[MsSql] val DatabaseErrorMessage =
+      s"MsSqlConfiguration Error. 'database' is not configured at: $database"
+  }
+
+}

@@ -1,0 +1,97 @@
+<!-- https://www.playframework.com/documentation/latest/SettingsLogger -->
+<configuration debug="true">
+  <conversionRule conversionWord="coloredLevel" converterClass="play.api.libs.logback.ColoredLevel"/>
+  <appender name="FILE" class="ch.qos.logback.core.FileAppender">
+    <file>${log.path:-./logs}/play-scala.log</file>
+    <encoder>
+      <pattern>{ "source": "[FILE]", "time": "%date{"yyyy-MM-dd'T'HH:mm:ss,SSSXXX", UTC}", "thread": "[%thread]", "level": "%level", "logger": "%logger{36}", "message": "%msg[%xException]" }%n</pattern>
+    </encoder>
+  </appender>
+
+  <appender name="AUDIT_LOCAL_DAILY_FILE_ROLLOVER" class="ch.qos.logback.core.rolling.RollingFileAppender">
+    <!-- The ':-' (without the quotes) allows us to define a default value for -->
+    <!-- the JVM parameter if it isn't provided.  We'll use ./logs as the default. -->
+    <file>${log.path:-./logs}/audit-daily.log</file>
+
+    <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+
+      <!-- The filename pattern determines the frequency of rollover.  Here, -->
+      <!-- we're defining a daily rollover. -->
+      <fileNamePattern>${log.path:-./logs}/audit-daily.%d{yyyy-MM-dd}.log</fileNamePattern>
+
+      <!-- Keep 30 'frequencies' (days in this case) of history -->
+      <maxHistory>30</maxHistory>
+    </rollingPolicy>
+    <encoder>
+      <pattern>%message%n%xException{10}</pattern>
+    </encoder>
+  </appender>
+  <logger name="AUDIT_LOCAL_DAILY_FILE_ROLLOVER" level="INFO" additivity="false">
+    <appender-ref ref="AUDIT_LOCAL_DAILY_FILE_ROLLOVER"/>
+  </logger>
+
+  <appender name="ACCESS_LOCAL_DAILY_FILE_ROLLOVER" class="ch.qos.logback.core.rolling.RollingFileAppender">
+    <!-- The ':-' (without the quotes) allows us to define a default value for -->
+    <!-- the JVM parameter if it isn't provided.  We'll use ./logs as the default. -->
+    <file>${log.path:-./logs}/access-daily.log</file>
+
+    <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+
+      <!-- The filename pattern determines the frequency of rollover.  Here, -->
+      <!-- we're defining a daily rollover. -->
+      <fileNamePattern>${log.path:-./logs}/access-daily.%d{yyyy-MM-dd}.log</fileNamePattern>
+
+      <!-- Keep 30 'frequencies' (days in this case) of history -->
+      <maxHistory>30</maxHistory>
+
+    </rollingPolicy>
+    <encoder>
+      <pattern>%message%n%xException{10}</pattern>
+    </encoder>
+  </appender>
+
+  <logger name="ACCESS_LOCAL_DAILY_FILE_ROLLOVER" level="INFO" additivity="false">
+    <appender-ref ref="ACCESS_LOCAL_DAILY_FILE_ROLLOVER"/>
+  </logger>
+
+  <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder>
+      <!--<pattern>%coloredLevel %logger{15} - %message%n%xException{10}</pattern>-->
+      <pattern>{ "source": "[STDOUT]", "time": "%date{"yyyy-MM-dd'T'HH:mm:ss,SSSXXX", UTC}", "level": "%level", "logger": "%logger{36}", "message": "%msg[%xException]" }%n</pattern>
+    </encoder>
+  </appender>
+
+  <appender name="ASYNCFILE" class="ch.qos.logback.classic.AsyncAppender" level="INFO">
+    <appender-ref ref="FILE"/>
+  </appender>
+
+  <appender name="ASYNCSTDOUT" class="ch.qos.logback.classic.AsyncAppender" level="INFO">
+    <appender-ref ref="STDOUT"/>
+  </appender>
+
+  <!-- Off these ones as they are annoying, and anyway we manage configuration ourselves -->
+  <logger name="com.avaje.ebean" level="WARN"/>
+  <logger name="com.avaje.ebeaninternal" level="WARN"/>
+  <logger name="com.gargoylesoftware" level="WARN"/>
+  <logger name="akka.event" level="WARN"/>
+  <logger name="akka.core" level="WARN"/>
+  <logger name="com.google.inject" level="WARN"/>
+  <logger name="io.netty" level="WARN"/>
+  <logger name="net.sf.ehcache" level="WARN"/>
+  <logger name="org.asynchttpclient.netty" level="WARN" />
+  <logger name="reactivemongo.api" level="WARN"/>
+  <logger name="reactivemongo.core" level="WARN"/>
+  <logger name="reactivemongo.core.actors.MongoDBSystem" level="INFO"/>
+  <logger name="reactivemongo" level="WARN" />
+  <logger name="shaded.netty" level="WARN"/>
+  <logger name="akka://mongodb-akka" level="INFO" />
+  <logger name="org.apache.http.impl.conn.PoolingHttpClientConnectionManager" level="WARN"/>
+
+  <root level="INFO">
+    <appender-ref ref="ASYNCFILE"/>
+    <appender-ref ref="ASYNCSTDOUT"/>
+  </root>
+
+
+</configuration>
+

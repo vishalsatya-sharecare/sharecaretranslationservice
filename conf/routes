@@ -1,0 +1,348 @@
+# Routes
+# This file defines all application routes (Higher priority routes first)
+# ~~~~
+# TODO - Update the routes file in order to use the correct URI prefix ( /dhs-audience-service/ -> /your-prefix/ )
+
+# Map static resources from the /public folder to the /assets URL path.
+# I don't recommend changing anything about this except for the /dhs-audience-service/ prefix.
+### NoDocs ###
+GET           /dhs-audience-service/docs/*file                            @controllers.Assets.at(path:String="/public/lib/swagger-ui", file:String)
+
+### NoDocs ###
+GET           /dhs-audience-service/assets/swagger.json                   @controllers.SwaggerController.specs
+
+### NoDocs ###
+GET           /dhs-audience-service/api                                   @controllers.SwaggerController.api
+
+### NoDocs ###
+GET           /dhs-audience-service/docs                                  @controllers.SwaggerController.docs
+
+### NoDocs ###
+GET           /dhs-audience-service/healthcheck                           @controllers.ServiceHealthCheck.check(details: Option[Boolean], warn: Option[Boolean])
+
+# Map static resources from the /public folder to the /assets URL path
+### NoDocs ###
+GET           /dhs-audience-service/assets/*file                          @controllers.Assets.versioned(path="/public", file: Asset)
+### NoDocs ###
+GET           /dhs-audience-service/public/*file                          @controllers.Assets.at(path:String="/public/", file:String)
+### NoDocs ###
+GET           /dhs-audience-service/public/yaml/*file                     @controllers.Assets.at(path:String="/public/yaml", file:String)
+
+
+
+###
+#  summary: Retrieve a Audience by audienceId
+#  description: returns an audience (assumedly published) by audience id
+#  parameters:
+#   - $ref: '#/definitions/BEARER_AUTH'
+#   - in: path
+#     type: string
+#     name: id
+#     description: unique uuid for the audience
+#     required: true
+#   - in: query
+#     type: string
+#     name: sponsor-id
+#     description: sponsor id
+#     required: true
+#  responses:
+#    200:
+#      description: success
+#      content:
+#        application/json:
+#           schema:
+#               $ref: '#/definitions/data.models.Audience'
+#    500:
+#       $ref: '#/definitions/INTERNAL_ERROR'
+###
+GET        /dhs-audience-service/audiences/:id              @controllers.AudienceController.get(id: String)
+
+###
+#  summary: Query Audiences by sponsor id
+#  description: returns a list of audiences based on sponsor id
+#  parameters:
+#   - $ref: '#/definitions/BEARER_AUTH'
+#   - in: query
+#     type: string
+#     name: sponsor-id
+#     description: id for the sponsor / group
+#     required: true
+#  responses:
+#    200:
+#      description: success
+#      content:
+#        application/json:
+#           schema:
+#               $ref: '#/definitions/data.models.Audience'
+#    500:
+#       $ref: '#/definitions/INTERNAL_ERROR'
+###
+GET        /dhs-audience-service/audiences                  @controllers.AudienceController.query()
+
+
+###
+#  summary: Check audience rules by payload
+#  description: Returns the audience membership based on the provided ruleset
+#  parameters:
+#   - $ref: '#/definitions/BEARER_AUTH'
+#   - in: body
+#     type: json
+#     name: audience
+#     description: json representing audience information
+#     required: true
+#   - in: query
+#     type: string
+#     name: sponsor-id
+#     description: sponsor id
+#     required: true
+#  responses:
+#    200:
+#      description: success
+#    500:
+#       $ref: '#/definitions/INTERNAL_ERROR'
+###
+POST       /dhs-audience-service/check-audience-rules       @controllers.AudienceController.checkAudienceRules()
+
+###
+#  summary: Publish an audience
+#  description: Publish an audience
+#  parameters:
+#   - $ref: '#/definitions/BEARER_AUTH'
+#   - in: body
+#     type: json
+#     name: audience
+#     description: json representing the audience
+#     required: true
+#   - in: query
+#     type: string
+#     name: sponsor-id
+#     description: sponsor id
+#     required: true
+#  responses:
+#    204:
+#       $ref: '#/definitions/NO_CONTENT'
+#    500:
+#       $ref: '#/definitions/INTERNAL_ERROR'
+###
+POST       /dhs-audience-service/audiences/publish          @controllers.AudienceController.publishAudience()
+
+###
+#  summary: Unpublish an audience
+#  description: Unpublishes an audience and removes it from visibility to its members
+#  parameters:
+#   - $ref: '#/definitions/BEARER_AUTH'
+#   - in: body
+#     type: json
+#     name: audience
+#     description: json representing the audience
+#     required: true
+#   - in: query
+#     type: string
+#     name: sponsor-id
+#     description: sponsor id
+#     required: true
+#  responses:
+#    204:
+#       $ref: '#/definitions/NO_CONTENT'
+#    500:
+#       $ref: '#/definitions/INTERNAL_ERROR'
+###
+POST       /dhs-audience-service/audiences/unpublish/:id    @controllers.AudienceController.unpublishAudience(id: String)
+
+POST       /dhs-audience-service/audiences/populate-memcached/sponsor/:sponsorId    @controllers.AudienceController.populateAudienceStatisticsInMemcached(sponsorId: String)
+#GET       /dhs-audience-service/checkMemcached/:id    @controllers.AudienceController.checkMemcached(id: String)
+
+
+###
+#  summary: Check Audience Membership
+#  description: Check membership based on audience criteria
+#  parameters:
+#   - $ref: '#/definitions/BEARER_AUTH'
+#   - in: body
+#     type: json
+#     name: sponsorId
+#     description: sponsor id
+#     required: true
+#   - in: body
+#     type: json
+#     name: demographics
+#     description: information about the user/member/item
+#     required: true
+#  responses:
+#    204:
+#       $ref: '#/definitions/NO_CONTENT'
+#    500:
+#       $ref: '#/definitions/INTERNAL_ERROR'
+###
+POST       /dhs-audience-service/audience-membership        @controllers.AudienceController.checkAudienceMembership()
+PATCH      /dhs-audience-service/audience-membership        @controllers.AudienceController.swapAudienceMembership()
+DELETE     /dhs-audience-service/audience-membership/:guid        @controllers.AudienceController.deleteAudienceMembership(guid:String)
+GET     /dhs-audience-service/audience-membership/:guid        @controllers.AudienceController.getAudienceMembership(guid:String)
+
+###
+#  summary: Fix audiences
+#  description: endpoint to fix audience disparities
+#  responses:
+#    204:
+#       $ref: '#/definitions/NO_CONTENT'
+#    500:
+#       $ref: '#/definitions/INTERNAL_ERROR'
+###
+GET        /dhs-audience-service/fix-audiences              @controllers.AudienceController.fixAudiences()
+POST       /dhs-audience-service/audiences/:id/member-offerings       @controllers.AudienceController.updateMemberOfferings(id:String)
+
+###
+#  summary: Reset Member Offering Status
+#  description: Reset member offering status by audience id
+#  parameters:
+#   - $ref: '#/definitions/BEARER_AUTH'
+#   - in: query
+#     type: string
+#     name: sponsorId
+#     description: sponsor id
+#     required: true
+#   - in: path
+#     type: string
+#     name: audienceId
+#     description: id for the audience to be reset
+#     required: true
+#  responses:
+#    204:
+#       $ref: '#/definitions/NO_CONTENT'
+#    500:
+#       $ref: '#/definitions/INTERNAL_ERROR'
+###
+
+POST       /dhs-audience-service/audiences/:id/member-offerings/reset       @controllers.AudienceController.resetMemberOfferingStatus(id:String)
+
+
+POST       /dhs-audience-service/sponsor/filters/create             @controllers.FilterConfigController.createFilters()
+
+###
+#  summary: Query Filter Settings by sponsor id
+#  description: returns a list of filter settings based on sponsor id
+#  parameters:
+#   - $ref: '#/definitions/BEARER_AUTH'
+#   - in: path
+#     type: string
+#     name: id
+#     description: Sponsor Id
+#     required: true
+#  responses:
+#    200:
+#      description: success
+#      content:
+#        application/json:
+#           schema:
+#               $ref: '#/definitions/data.models.Audience'
+#    500:
+#       $ref: '#/definitions/INTERNAL_ERROR'
+###
+GET        /dhs-audience-service/sponsor/:id/filters              @controllers.FilterConfigController.filterConfigBySponsor(id:String)
+
+###
+#  summary: Query Standard Filter Settings by sponsor id and Filter Key
+#  description: returns a list of standard filter settings based on sponsor id and filter key
+#  parameters:
+#   - $ref: '#/definitions/BEARER_AUTH'
+#   - in: path
+#     type: string
+#     name: id
+#     description: Sponsor Id
+#     required: true
+#   - in: path
+#     type: string
+#     name: filterKey
+#     description: Standard Filter Key
+#     required: true
+#  responses:
+#    200:
+#      description: success
+#      content:
+#        application/json:
+#           schema:
+#               $ref: '#/definitions/data.models.Audience'
+#    500:
+#       $ref: '#/definitions/INTERNAL_ERROR'
+###
+GET        /dhs-audience-service/sponsor/:id/filter/:filterKey     @controllers.FilterConfigController.filterConfigBySponsorAndKey(id:String, filterKey:String)
+
+###
+#  summary: Update single filter config (Standard/Hierarchical) for a sponsor
+#  description: Update single filter config (Standard/Hierarchical) for a sponsor
+#  parameters:
+#   - $ref: '#/definitions/BEARER_AUTH'
+#   - in: path
+#     type: string
+#     name: id
+#     description: Sponsor Id
+#     required: true
+#   - in: path
+#     type: string
+#     name: filterKey
+#     description: Standard Filter Key
+#     required: true
+#   - in: body
+#     type: json
+#     name: filter
+#     description: Standard/Hierarchical filter json
+#     required: true
+#  responses:
+#    200:
+#       description: success
+#    500:
+#       $ref: '#/definitions/INTERNAL_ERROR'
+###
+PATCH        /dhs-audience-service/sponsor/:id/filter/:filterKey              @controllers.FilterConfigController.saveSingleFilterConfig(id:String, filterKey:String)
+
+###
+#  summary: Update hierarchical filters config (hierarchies) for a sponsor
+#  description: Update hierarchical filters config (hierarchies) for a sponsor
+#  parameters:
+#   - $ref: '#/definitions/BEARER_AUTH'
+#   - in: path
+#     type: string
+#     name: id
+#     description: Sponsor Id
+#     required: true
+#   - in: body
+#     type: json
+#     name: filters
+#     description: Hierarchical filters json
+#     required: true
+#  responses:
+#    200:
+#       description: success
+#    500:
+#       $ref: '#/definitions/INTERNAL_ERROR'
+###
+PATCH        /dhs-audience-service/sponsor/:id/filters              @controllers.FilterConfigController.updateHierarchicalFilters(id:String)
+
+
+POST       /dhs-audience-service/check-single-rule       @controllers.AudienceController.checkSingleRule()
+
+###
+#  summary: template
+#  description: template
+#  parameters:
+#   - $ref: '#/definitions/BEARER_AUTH'
+#   - in: query
+#     type: string
+#     name: sponsor-id
+#     description: sponsor id
+#  responses:
+#    200:
+#      description: success
+#      content:
+#        application/json:
+#           schema:
+#               $ref: '#/definitions/data.models.Audience'
+#    204:
+#       $ref: '#/definitions/NO_CONTENT'
+#    304:
+#       $ref: '#/definitions/NOT_MODIFIED'
+#    500:
+#       $ref: '#/definitions/INTERNAL_ERROR'
+###
+
+POST /audience-translation-service/translate        @controllers.PhraseTranslationController.translatePhrases()

@@ -1,0 +1,9 @@
+*.class
+*.log
+.idea/
+# TODO - CHANGE TO COMPILE FOLDER NAME
+dhs-audience-service/
+logs/
+target/
+project/target/
+project/project/

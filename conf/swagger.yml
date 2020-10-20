@@ -1,0 +1,48 @@
+openapi: '3.0.0'
+
+info:
+  title: "DHS Audience Proxy Service"
+  description: ""
+  version: "1.0.0"
+servers:
+  - url: https://api.sharecare.com
+    description: Prod US
+  - url: https://api.stage.sharecare.com
+    description: Stage US
+  - url: https://api.qa.sharecare.com
+    description: QA US
+  - url: https://api.uat.sharecare.com
+    description: UAT US
+  - url: https://api.dev.sharecare.com
+    description: Dev US
+  - url: https://api.sharecare.com.br
+    description: Prod BR
+  - url: https://api.stage.sharecare.com.br
+    description: Stage BR
+schemes:
+  - "https"
+consumes:
+  - application/json
+produces:
+  - application/json
+definitions:
+  BEARER_AUTH:
+    in: header
+    name: Authorization
+    description: |
+      **Bearer** `{access_token}` or **Basic** `{base64 client_id:secret}`
+    required: true
+    schema:
+      type: string
+  StringType:
+    type: string
+  OK:
+    description: Success!
+  NO_CONTENT:
+    description: No Content (update/insertion was successful or the retrieval yielded an empty list)
+  NOT_MODIFIED:
+    description: Not Modified (modification and/or change was unsuccessful or resource was not found)
+  INTERNAL_ERROR:
+    description: Internal Server Error (complete failure)
+  NOT_IMPLEMENTED:
+    description: Not Yet Implemented.
